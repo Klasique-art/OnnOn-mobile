@@ -12,14 +12,25 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import type { MediaStream } from "react-native-webrtc";
 import ScreenNav from "@/src/components/ScreenNav";
 import { colors, type } from "@/src/theme/colors";
+import { hasRealtimeConfig, runtimeConfig } from "@/src/config/runtime";
 import {
   CallChatMessage,
   CallParticipant,
   callChatReplies,
   remoteParticipantPool,
 } from "@/src/data/mockCall";
+import { socketManager } from "@/src/realtime/socket";
+import { getRouterCapabilities } from "@/src/realtime/mediasoup.socket";
+import {
+  joinRoom,
+  leaveRoom,
+  onRoomMessage,
+  sendRoomMessage,
+} from "@/src/realtime/room.socket";
+import { getLocalMediaStream, stopStream } from "@/src/calls/webrtc";
 
 function makeRoomId() {
   const chars = "abcdefghijklmnopqrstuvwxyz";
@@ -49,6 +60,13 @@ export default function CallRoomScreen() {
   const [isCamOn, setIsCamOn] = useState(true);
   const [isShareRequested, setIsShareRequested] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [authToken, setAuthToken] = useState("");
+  const [enableRealtime, setEnableRealtime] = useState(false);
+  const [realtimeStatus, setRealtimeStatus] = useState<
+    "idle" | "connecting" | "connected" | "failed"
+  >("idle");
+  const [realtimeInfo, setRealtimeInfo] = useState("Simulation mode active");
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
 
   const activeRemotePool = useMemo(
     () =>
@@ -73,6 +91,13 @@ export default function CallRoomScreen() {
     const usableWidth = width - horizontalPadding - totalGap;
     return Math.max(95, Math.floor(usableWidth / tileColumns));
   }, [tileColumns, width]);
+
+  useEffect(() => {
+    return () => {
+      stopStream(localStream);
+      socketManager.disconnect();
+    };
+  }, [localStream]);
 
   useEffect(() => {
     if (phase !== "inCall") return;
@@ -102,7 +127,7 @@ export default function CallRoomScreen() {
     return `${h}:${m}:${s}`;
   }, [elapsedSeconds]);
 
-  const bootstrapParticipants = (activeRoomId: string) => {
+  const bootstrapParticipants = async (activeRoomId: string) => {
     const local: CallParticipant = {
       id: "local-me",
       name: displayName.trim() || "You",
@@ -134,15 +159,56 @@ export default function CallRoomScreen() {
     ]);
     setElapsedSeconds(0);
     setPhase("inCall");
+
+    if (enableRealtime && authToken.trim() && hasRealtimeConfig) {
+      setRealtimeStatus("connecting");
+      setRealtimeInfo("Connecting to signaling...");
+      try {
+        const socket = socketManager.connect(authToken.trim());
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error("Socket timeout")), 12000);
+          socket.on("connect", () => {
+            clearTimeout(timeout);
+            resolve();
+          });
+          socket.on("connect_error", (err) => {
+            clearTimeout(timeout);
+            reject(err);
+          });
+        });
+
+        joinRoom(activeRoomId);
+        const capabilities = await getRouterCapabilities(activeRoomId);
+        if (capabilities.error) {
+          setRealtimeInfo(`Connected, mediasoup error: ${capabilities.error}`);
+        } else {
+          setRealtimeInfo("Connected to backend signaling + mediasoup router.");
+        }
+        setRealtimeStatus("connected");
+
+        try {
+          const stream = await getLocalMediaStream({ audio: isMicOn, video: isCamOn });
+          setLocalStream(stream);
+        } catch {
+          setRealtimeInfo("Connected signaling, but media permission/stream failed.");
+        }
+      } catch {
+        setRealtimeStatus("failed");
+        setRealtimeInfo("Realtime connect failed. Using simulation fallback.");
+      }
+    } else {
+      setRealtimeStatus("idle");
+      setRealtimeInfo("Simulation mode active");
+    }
   };
 
-  const createMeetingNow = () => {
-    bootstrapParticipants(makeRoomId());
+  const createMeetingNow = async () => {
+    await bootstrapParticipants(makeRoomId());
   };
 
-  const joinMeeting = () => {
+  const joinMeeting = async () => {
     if (!joinRoomId.trim()) return;
-    bootstrapParticipants(joinRoomId.trim().toLowerCase());
+    await bootstrapParticipants(joinRoomId.trim().toLowerCase());
   };
 
   const leaveCall = () => {
@@ -155,6 +221,14 @@ export default function CallRoomScreen() {
     setElapsedSeconds(0);
     setChatOpen(false);
     setParticipantsOpen(false);
+    stopStream(localStream);
+    setLocalStream(null);
+    if (socketManager.isConnected()) {
+      leaveRoom(roomId);
+      socketManager.disconnect();
+    }
+    setRealtimeStatus("idle");
+    setRealtimeInfo("Simulation mode active");
   };
 
   const toggleLocalMic = () => {
@@ -211,6 +285,10 @@ export default function CallRoomScreen() {
     setChatMessages((prev) => [...prev, mine]);
     setDraftMessage("");
 
+    if (socketManager.isConnected()) {
+      sendRoomMessage({ roomId, text });
+    }
+
     const remoteParticipants = participants.filter((p) => !p.isLocal);
     if (remoteParticipants.length === 0) return;
     const randomRemote =
@@ -230,6 +308,23 @@ export default function CallRoomScreen() {
       setChatMessages((prev) => [...prev, reply]);
     }, 900);
   };
+
+  useEffect(() => {
+    if (!socketManager.isConnected()) return;
+    const unsubscribe = onRoomMessage((payload) => {
+      if (payload.userId === "local-me") return;
+      const incoming: CallChatMessage = {
+        id: `chat-${Date.now()}-socket`,
+        senderId: payload.userId,
+        senderName: payload.displayName || "Participant",
+        text: payload.text,
+        sentAt: payload.sentAt || new Date().toISOString(),
+        mine: false,
+      };
+      setChatMessages((prev) => [...prev, incoming]);
+    });
+    return unsubscribe;
+  }, [phase]);
 
   if (phase === "lobby") {
     return (
@@ -286,6 +381,35 @@ export default function CallRoomScreen() {
           </View>
 
           <View style={styles.panel}>
+            <Text style={styles.sectionTitle}>Realtime Integration (Optional)</Text>
+            <Text style={styles.integrationHelp}>
+              Backend: {runtimeConfig.socketUrl}
+            </Text>
+            <TextInput
+              value={authToken}
+              onChangeText={setAuthToken}
+              style={styles.input}
+              placeholder="JWT token (for real socket + mediasoup)"
+              placeholderTextColor={colors.textMuted}
+              autoCapitalize="none"
+            />
+            <Pressable
+              onPress={() => setEnableRealtime((prev) => !prev)}
+              style={[
+                styles.preToggle,
+                !enableRealtime && styles.preToggleMuted,
+              ]}
+            >
+              <Text style={styles.preToggleText}>
+                {enableRealtime ? "Realtime: Enabled" : "Realtime: Disabled"}
+              </Text>
+            </Pressable>
+            <Text style={styles.integrationStatus}>
+              Status: {realtimeStatus.toUpperCase()} - {realtimeInfo}
+            </Text>
+          </View>
+
+          <View style={styles.panel}>
             <Text style={styles.sectionTitle}>Start New Meeting</Text>
             <TextInput
               value={callTitle}
@@ -329,6 +453,11 @@ export default function CallRoomScreen() {
           <Text style={styles.roomTitle}>{callTitle}</Text>
           <Text style={styles.roomMeta}>
             Room: {roomId} • {formattedElapsed}
+          </Text>
+          <Text style={styles.roomMeta}>
+            {realtimeStatus === "connected"
+              ? "Realtime connected"
+              : "Simulation mode"}
           </Text>
         </View>
         <View style={styles.headerActions}>
@@ -617,6 +746,17 @@ const styles = StyleSheet.create({
     fontFamily: type.body,
     fontSize: 15,
     fontWeight: "800",
+  },
+  integrationHelp: {
+    color: colors.textMuted,
+    fontFamily: type.body,
+    fontSize: 12,
+    marginTop: -4,
+  },
+  integrationStatus: {
+    color: colors.textMuted,
+    fontFamily: type.body,
+    fontSize: 12,
   },
   input: {
     borderWidth: 1,

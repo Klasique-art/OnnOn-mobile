@@ -10,6 +10,7 @@
 - Billing screen is now a fully simulated local subscription flow using `src/data/mockBilling.ts`.
 - Auth login now uses reusable Formik + Yup form primitives in `src/components/forms/*`.
 - Call room is now a full simulated Zoom-like flow using `src/data/mockCall.ts` with pre-join, adaptive grid, controls, participants panel, and meeting chat.
+- Realtime call groundwork is added: WebRTC native deps, socket/mediasoup helpers, and optional realtime mode in `app/(app)/call-room.tsx`.
 
 ## UI Direction
 - Prioritize accessibility in color contrast and typography.
