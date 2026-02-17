@@ -1,0 +1,347 @@
+Onnon Backend to React Native Expo Frontend Integration Guide
+
+Date: February 16, 2026
+Repo: d:\onnon-backend
+
+Overview
+
+This backend provides:
+1) REST APIs for auth, profiles, meetings, billing, and chat history.
+2) Socket.io for realtime chat/file signaling and mediasoup signaling.
+3) mediasoup SFU for WebRTC audio/video.
+
+Your Expo app should be built in this order:
+1) Auth
+2) Profile
+3) Meetings (REST)
+4) Realtime room chat + DM
+5) File sharing
+6) Video/audio (mediasoup)
+7) Billing/subscriptions
+
+--------------------------------------------------
+1. Base URL and Auth
+--------------------------------------------------
+
+Local backend:
+- http://localhost:3000 (emulator/simulator)
+
+If testing from physical device:
+- Use your PC LAN IP, for example: http://192.168.1.100:3000
+
+JWT:
+- Store token securely after login/register.
+- Send header on protected APIs:
+  Authorization: Bearer <token>
+
+Main auth endpoints:
+- POST /api/users/register
+- POST /api/users/login
+- POST /api/users/verify-email
+- POST /api/users/resend-otp
+- POST /api/users/forgot-password
+- POST /api/users/reset-password
+- POST /api/users/change-password (protected)
+- GET /api/users/me (protected)
+- DELETE /api/users/delete-account (protected)
+
+Validation constraints you should mirror in UI:
+- Register password: 8-30 chars, uppercase + lowercase + number + symbol.
+- OTP code: 6 chars.
+
+Notes:
+- Login does not block unverified users. You should handle isVerified in UI flow.
+
+--------------------------------------------------
+2. Profile Module
+--------------------------------------------------
+
+Endpoints:
+- GET /api/profile/me (protected)
+- PUT /api/profile/me (protected)
+- POST /api/profile/avatar (protected, multipart form-data, field name: avatar)
+- DELETE /api/profile/avatar (protected)
+- GET /api/profile/:userId (public)
+
+Profile fields:
+- displayName (2-50)
+- bio (max 200)
+- preferences: theme, notifications, audioDefault, videoDefault
+
+Expo implementation:
+- Use image picker.
+- Upload avatar as multipart form data.
+- Keep cached profile in state/store for chat and meeting UI.
+
+--------------------------------------------------
+3. Meetings Module (REST lifecycle)
+--------------------------------------------------
+
+Endpoints (all protected):
+- POST /api/meetings/create
+- GET /api/meetings/history?page=1&limit=10
+- GET /api/meetings/:roomId
+- POST /api/meetings/:roomId/join
+- POST /api/meetings/:roomId/leave
+- PUT /api/meetings/:roomId
+- DELETE /api/meetings/:roomId
+
+Meeting behavior from backend:
+- roomId format: abc-def-ghi
+- Free plan max participants default: 5
+- Duration limits depend on plan
+- Host-only update/end permissions
+- Password-protected rooms supported
+
+UI recommendations:
+- Create Meeting screen: title, optional password, settings toggles.
+- Join screen: roomId + optional password prompt if required.
+- History screen with pagination.
+
+--------------------------------------------------
+4. Chat Module (REST + Socket.io)
+--------------------------------------------------
+
+REST endpoints (protected):
+- GET /api/chat/dm/:userId?page=1&limit=50
+- POST /api/chat/dm/:userId/mark-read
+- GET /api/chat/unread-count
+- GET /api/chat/conversations?limit=20
+
+Socket auth:
+- Connect with token in handshake:
+  auth: { token }
+
+Room chat events
+Client emits:
+- room:join (roomId)
+- room:leave (roomId)
+- room:message ({ roomId, text })
+- room:typing (roomId)
+- room:stop-typing (roomId)
+
+Server emits:
+- room:joined
+- room:left
+- room:user-joined
+- room:user-left
+- room:message
+- room:typing
+- room:stop-typing
+- room:error
+
+DM events
+Client emits:
+- dm:send ({ toUserId, text })
+- dm:read (messageId)
+- dm:typing (toUserId)
+- dm:stop-typing (toUserId)
+
+Server emits:
+- dm:message
+- dm:sent
+- dm:read-receipt
+- dm:typing
+- dm:stop-typing
+- dm:error
+
+Important backend note:
+- The backend emits DMs to io.to(toUserId). If delivery is inconsistent, backend may need personal room join logic.
+
+--------------------------------------------------
+5. File Sharing Module (Socket)
+--------------------------------------------------
+
+Client emit:
+- file:upload
+  Payload:
+  {
+    file,          // binary payload/buffer
+    filename,
+    mimeType,
+    roomId?,       // for room file
+    toUserId?      // for DM file
+  }
+
+Rules:
+- Exactly one of roomId or toUserId
+- Max size 10MB
+
+Server emits:
+- room:file
+- dm:file
+- file:error
+
+Expo tips:
+- Use expo-document-picker or expo-image-picker.
+- Read file bytes/base64 and send via socket payload.
+- Show upload progress/loading state client-side.
+
+--------------------------------------------------
+6. Video/Audio Module (mediasoup signaling)
+--------------------------------------------------
+
+Socket callback events:
+- mediasoup:getRouterCapabilities
+- mediasoup:createTransport
+- mediasoup:connectTransport
+- mediasoup:produce
+- mediasoup:consume
+- mediasoup:resumeConsumer
+- mediasoup:pauseProducer
+- mediasoup:resumeProducer
+- mediasoup:closeProducer
+- mediasoup:getProducers
+
+Server push events:
+- mediasoup:newProducer
+- mediasoup:producerClosed
+- mediasoup:producerPaused
+- mediasoup:producerResumed
+- mediasoup:consumerClosed
+
+Frontend stack for Expo:
+- react-native-webrtc
+- mediasoup-client
+- socket.io-client
+
+Implementation sequence:
+1) Join room.
+2) Load router RTP capabilities.
+3) Create send/recv transports.
+4) Produce local audio/video tracks.
+5) Consume remote producers.
+6) Handle producer close/pause/resume events.
+
+Network requirement:
+- Backend media ports: 10000-10100 UDP/TCP must be reachable in deployed environment.
+
+--------------------------------------------------
+7. Payments/Subscriptions Module
+--------------------------------------------------
+
+Endpoints:
+- GET /api/payments/plans (public)
+- GET /api/payments/subscription (protected)
+- POST /api/payments/checkout (protected)
+- POST /api/payments/upgrade (protected)
+- POST /api/payments/cancel (protected)
+- GET /api/payments/history?page=1&limit=10 (protected)
+- GET /api/payments/billing-portal (protected)
+
+Checkout payload:
+- { planId, successUrl, cancelUrl }
+
+Expo implication:
+- Use deep links for successUrl/cancelUrl return to app.
+- Handle pending/cancelled/success UI states.
+
+--------------------------------------------------
+8. Response + Error Handling Strategy
+--------------------------------------------------
+
+Backend responses are not fully uniform. Your client should handle:
+- Pattern A: { success: true, data: ... }
+- Pattern B: raw object payloads (chat history endpoints)
+
+Error strategy:
+- Prefer server message from response.message when present.
+- Fallback to generic network/server error text.
+
+Build a single helper:
+- normalizeApiResponse(response)
+- normalizeApiError(error)
+
+--------------------------------------------------
+9. Suggested Expo Project Structure
+--------------------------------------------------
+
+src/
+  api/
+    client.ts
+    auth.api.ts
+    profile.api.ts
+    meetings.api.ts
+    chat.api.ts
+    payments.api.ts
+  realtime/
+    socket.ts
+    chat.socket.ts
+    mediasoup.socket.ts
+    files.socket.ts
+  features/
+    auth/
+    profile/
+    meetings/
+    chat/
+    calls/
+    billing/
+  store/
+    auth.store.ts
+    profile.store.ts
+    meetings.store.ts
+    chat.store.ts
+    call.store.ts
+  utils/
+    error.ts
+    links.ts
+    permissions.ts
+
+--------------------------------------------------
+10. Recommended Delivery Plan
+--------------------------------------------------
+
+Phase 1
+- Auth + token persistence + /me bootstrap
+- Profile read/update/avatar upload
+
+Phase 2
+- Meeting CRUD + history + join/leave
+- Room chat and typing
+
+Phase 3
+- DM list/history/read receipts
+- File sharing in room and DM
+
+Phase 4
+- mediasoup calling (audio/video, mute/camera toggles, participant tiles)
+
+Phase 5
+- Plans/subscription screens + Stripe checkout deep-link returns
+
+--------------------------------------------------
+11. Quick Test Checklist
+--------------------------------------------------
+
+Auth
+- Register, login, app restart token restore, logout
+
+Profile
+- Update displayName/bio/preferences
+- Upload/remove avatar
+
+Meetings
+- Create, join, leave, end
+- Invalid password handling
+- Full-room handling
+
+Chat
+- Room message flow between 2 users
+- DM send/receive/read receipt
+- Typing indicators
+
+Files
+- Room and DM file upload
+- >10MB rejection
+
+Calls
+- Join call with 2 devices
+- Mute/unmute + camera on/off
+- Reconnect behavior after network drop
+
+Payments
+- Plans list
+- Checkout open
+- Subscription refresh after completion
+
+End of guide.
