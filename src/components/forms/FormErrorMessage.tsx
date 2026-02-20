@@ -15,9 +15,9 @@ export default function FormErrorMessage({
 
 const styles = StyleSheet.create({
   error: {
-    color: "#8C2D1E",
-    backgroundColor: "#FCEBE8",
-    borderColor: "#E8C1BB",
+    color: "#DC0000",
+    backgroundColor: "#FFE5E5",
+    borderColor: "#F3A3A3",
     borderWidth: 1,
     borderRadius: 10,
     paddingHorizontal: 10,
@@ -26,3 +26,4 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
 });
+

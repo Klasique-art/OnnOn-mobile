@@ -35,7 +35,7 @@ export const billingPlans: BillingPlan[] = [
     priceMonthlyCents: 999,
     maxParticipants: 25,
     maxDurationLabel: "24 hours",
-    accent: "#0A7A5A",
+    accent: "#F6A402",
     features: ["HD calls", "25 participants", "Long meetings", "Screen share"],
   },
   {
@@ -45,7 +45,7 @@ export const billingPlans: BillingPlan[] = [
     priceMonthlyCents: 2999,
     maxParticipants: 100,
     maxDurationLabel: "24 hours",
-    accent: "#1E5AA8",
+    accent: "#DC0000",
     features: ["100 participants", "Recording", "Breakout rooms", "Priority support"],
   },
 ];
@@ -73,3 +73,4 @@ export const mockPaymentHistory: PaymentRecord[] = [
     description: "Basic Plan Monthly",
   },
 ];
+

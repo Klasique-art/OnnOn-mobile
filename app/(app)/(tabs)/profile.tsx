@@ -371,7 +371,7 @@ function PreferenceRow({
         value={value}
         onValueChange={onChange}
         disabled={disabled}
-        trackColor={{ false: "#B7C5D5", true: "#8FD1BB" }}
+        trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
         thumbColor={value ? colors.primary : "#EEF3F8"}
       />
     </View>
@@ -406,7 +406,7 @@ const styles = StyleSheet.create({
     width: 260,
     height: 260,
     borderRadius: 130,
-    backgroundColor: "#D8F1E6",
+    backgroundColor: "#FFECCB",
     bottom: -120,
     left: -90,
   },
@@ -499,7 +499,7 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
   verifiedBadge: {
-    backgroundColor: "#D5F3E8",
+    backgroundColor: "#FFEBC9",
     borderRadius: 999,
     paddingHorizontal: 8,
     paddingVertical: 4,
@@ -674,17 +674,18 @@ const styles = StyleSheet.create({
   },
   logoutBtn: {
     marginTop: 6,
-    backgroundColor: "#FCEBE8",
+    backgroundColor: "#FFE5E5",
     borderWidth: 1,
-    borderColor: "#E8C1BB",
+    borderColor: "#F3A3A3",
     borderRadius: 10,
     paddingVertical: 11,
     alignItems: "center",
   },
   logoutText: {
-    color: "#8C2D1E",
+    color: "#DC0000",
     fontFamily: type.body,
     fontSize: 14,
     fontWeight: "700",
   },
 });
+

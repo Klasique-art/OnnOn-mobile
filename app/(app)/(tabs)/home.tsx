@@ -158,7 +158,7 @@ const styles = StyleSheet.create({
     width: 300,
     height: 300,
     borderRadius: 150,
-    backgroundColor: "#D6ECE3",
+    backgroundColor: "#FFE6BA",
     top: -120,
     right: -90,
   },
@@ -335,7 +335,7 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   liveBadge: {
-    backgroundColor: "#D5F3E8",
+    backgroundColor: "#FFEBC9",
   },
   scheduledBadge: {
     backgroundColor: "#E5EEF8",
@@ -363,3 +363,4 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
 });
+

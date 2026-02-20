@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "OnnOn",
+    "name": "OnnOnn",
     "slug": "OnnOn",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -34,6 +34,9 @@
         "android.permission.INTERNET",
         "android.permission.MODIFY_AUDIO_SETTINGS",
         "android.permission.RECORD_AUDIO",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION",
+        "android.permission.POST_NOTIFICATIONS",
         "android.permission.SYSTEM_ALERT_WINDOW",
         "android.permission.WAKE_LOCK",
         "android.permission.BLUETOOTH"
@@ -60,7 +63,8 @@
         }
       ],
       "@react-native-community/datetimepicker",
-      "@config-plugins/react-native-webrtc"
+      "@config-plugins/react-native-webrtc",
+      "./plugins/withWebRTCMediaProjection"
     ],
     "experiments": {
       "typedRoutes": true,

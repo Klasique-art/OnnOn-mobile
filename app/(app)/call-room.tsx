@@ -1,6 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useMemo, useState, useEffect } from "react";
 import {
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   Pressable,
@@ -12,7 +13,7 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import type { MediaStream } from "react-native-webrtc";
+import { RTCView, type MediaStream } from "react-native-webrtc";
 import ScreenNav from "@/src/components/ScreenNav";
 import { colors, type } from "@/src/theme/colors";
 import { hasRealtimeConfig, runtimeConfig } from "@/src/config/runtime";
@@ -30,7 +31,11 @@ import {
   onRoomMessage,
   sendRoomMessage,
 } from "@/src/realtime/room.socket";
-import { getLocalMediaStream, stopStream } from "@/src/calls/webrtc";
+import {
+  getLocalMediaStream,
+  getScreenShareStream,
+  stopStream,
+} from "@/src/calls/webrtc";
 
 function makeRoomId() {
   const chars = "abcdefghijklmnopqrstuvwxyz";
@@ -67,6 +72,11 @@ export default function CallRoomScreen() {
   >("idle");
   const [realtimeInfo, setRealtimeInfo] = useState("Simulation mode active");
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [screenShareStream, setScreenShareStream] = useState<MediaStream | null>(null);
+  const [mediaInfo, setMediaInfo] = useState("Camera and mic not started yet.");
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false);
 
   const activeRemotePool = useMemo(
     () =>
@@ -95,9 +105,10 @@ export default function CallRoomScreen() {
   useEffect(() => {
     return () => {
       stopStream(localStream);
+      stopStream(screenShareStream);
       socketManager.disconnect();
     };
-  }, [localStream]);
+  }, [localStream, screenShareStream]);
 
   useEffect(() => {
     if (phase !== "inCall") return;
@@ -106,6 +117,14 @@ export default function CallRoomScreen() {
     }, 1000);
     return () => clearInterval(id);
   }, [phase]);
+
+  useEffect(() => {
+    if (phase !== "inCall" || !isRecording) return;
+    const id = setInterval(() => {
+      setRecordingSeconds((prev) => prev + 1);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [phase, isRecording]);
 
   useEffect(() => {
     if (phase !== "inCall" || participants.length <= 1) return;
@@ -126,6 +145,118 @@ export default function CallRoomScreen() {
     const s = String(elapsedSeconds % 60).padStart(2, "0");
     return `${h}:${m}:${s}`;
   }, [elapsedSeconds]);
+  const formattedRecording = useMemo(() => {
+    const m = String(Math.floor(recordingSeconds / 60)).padStart(2, "0");
+    const s = String(recordingSeconds % 60).padStart(2, "0");
+    return `${m}:${s}`;
+  }, [recordingSeconds]);
+  const isSharingScreen = isShareRequested && !!screenShareStream;
+
+  const setLocalParticipantState = (nextMicOn: boolean, nextCamOn: boolean) => {
+    setParticipants((prev) =>
+      prev.map((p) =>
+        p.isLocal ? { ...p, isMicOn: nextMicOn, isCameraOn: nextCamOn } : p
+      )
+    );
+  };
+
+  const hasTrack = (kind: "audio" | "video") =>
+    Boolean(localStream?.getTracks().find((track) => track.kind === kind));
+
+  const setTrackEnabled = (kind: "audio" | "video", enabled: boolean) => {
+    localStream
+      ?.getTracks()
+      .filter((track) => track.kind === kind)
+      .forEach((track) => {
+        track.enabled = enabled;
+      });
+  };
+
+  const startOrRefreshLocalMedia = async ({
+    audio,
+    video,
+  }: {
+    audio: boolean;
+    video: boolean;
+  }) => {
+    if (!audio && !video) {
+      stopStream(localStream);
+      setLocalStream(null);
+      setMediaInfo("Camera and mic are off.");
+      return;
+    }
+
+    try {
+      stopStream(localStream);
+      const stream = await getLocalMediaStream({ audio, video });
+      setLocalStream(stream);
+      setMediaInfo("Camera and mic connected.");
+    } catch {
+      setLocalStream(null);
+      setMediaInfo("Could not access camera/mic. Check device permissions.");
+      setIsMicOn(false);
+      setIsCamOn(false);
+      setLocalParticipantState(false, false);
+    }
+  };
+
+  const stopScreenShare = () => {
+    stopStream(screenShareStream);
+    setScreenShareStream(null);
+    setIsShareRequested(false);
+  };
+
+  const toggleScreenShare = async () => {
+    if (isShareRequested) {
+      stopScreenShare();
+      setMediaInfo("Screen sharing stopped.");
+      return;
+    }
+
+    try {
+      const stream = await getScreenShareStream();
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.onended = () => {
+          stopScreenShare();
+          setMediaInfo("Screen sharing ended.");
+        };
+      }
+      setScreenShareStream(stream);
+      setIsShareRequested(true);
+      setMediaInfo("Screen sharing active.");
+    } catch {
+      setMediaInfo("Unable to start screen sharing on this device/build.");
+    }
+  };
+
+  const startRecording = async () => {
+    setIsRecording(true);
+    setRecordingSeconds(0);
+    setMediaInfo("Recording started (local simulation).");
+    Alert.alert(
+      "Use Device Screen Recorder",
+      "For reliable recording, use your phone's built-in screen recorder from quick settings."
+    );
+  };
+
+  const stopRecording = async () => {
+    setIsRecording(false);
+    setMediaInfo("Recording stopped (local simulation).");
+    Alert.alert(
+      "Find Your Recording",
+      "Android (Samsung): Gallery > Albums > Screen recordings\n\niOS: Photos app > Recents/Screen Recordings"
+    );
+  };
+
+  const toggleRecording = async () => {
+    if (isRecording) {
+      await stopRecording();
+    } else {
+      await startRecording();
+    }
+    setIsMoreMenuOpen(false);
+  };
 
   const bootstrapParticipants = async (activeRoomId: string) => {
     const local: CallParticipant = {
@@ -159,6 +290,7 @@ export default function CallRoomScreen() {
     ]);
     setElapsedSeconds(0);
     setPhase("inCall");
+    await startOrRefreshLocalMedia({ audio: isMicOn, video: isCamOn });
 
     if (enableRealtime && authToken.trim() && hasRealtimeConfig) {
       setRealtimeStatus("connecting");
@@ -185,13 +317,6 @@ export default function CallRoomScreen() {
           setRealtimeInfo("Connected to backend signaling + mediasoup router.");
         }
         setRealtimeStatus("connected");
-
-        try {
-          const stream = await getLocalMediaStream({ audio: isMicOn, video: isCamOn });
-          setLocalStream(stream);
-        } catch {
-          setRealtimeInfo("Connected signaling, but media permission/stream failed.");
-        }
       } catch {
         setRealtimeStatus("failed");
         setRealtimeInfo("Realtime connect failed. Using simulation fallback.");
@@ -221,8 +346,15 @@ export default function CallRoomScreen() {
     setElapsedSeconds(0);
     setChatOpen(false);
     setParticipantsOpen(false);
+    setIsMoreMenuOpen(false);
     stopStream(localStream);
     setLocalStream(null);
+    stopScreenShare();
+    if (isRecording) {
+      void stopRecording();
+    }
+    setRecordingSeconds(0);
+    setMediaInfo("Camera and mic not started yet.");
     if (socketManager.isConnected()) {
       leaveRoom(roomId);
       socketManager.disconnect();
@@ -232,21 +364,23 @@ export default function CallRoomScreen() {
   };
 
   const toggleLocalMic = () => {
-    setIsMicOn((prev) => !prev);
-    setParticipants((prev) =>
-      prev.map((p) =>
-        p.isLocal ? { ...p, isMicOn: !isMicOn } : p
-      )
-    );
+    const nextMic = !isMicOn;
+    setIsMicOn(nextMic);
+    setLocalParticipantState(nextMic, isCamOn);
+    setTrackEnabled("audio", nextMic);
+    if (phase === "inCall" && nextMic && !hasTrack("audio")) {
+      void startOrRefreshLocalMedia({ audio: nextMic, video: isCamOn });
+    }
   };
 
   const toggleLocalCam = () => {
-    setIsCamOn((prev) => !prev);
-    setParticipants((prev) =>
-      prev.map((p) =>
-        p.isLocal ? { ...p, isCameraOn: !isCamOn } : p
-      )
-    );
+    const nextCam = !isCamOn;
+    setIsCamOn(nextCam);
+    setLocalParticipantState(isMicOn, nextCam);
+    setTrackEnabled("video", nextCam);
+    if (phase === "inCall" && nextCam && !hasTrack("video")) {
+      void startOrRefreshLocalMedia({ audio: isMicOn, video: nextCam });
+    }
   };
 
   const addParticipant = () => {
@@ -360,7 +494,7 @@ export default function CallRoomScreen() {
                 <Ionicons
                   name={isMicOn ? "mic" : "mic-off"}
                   size={16}
-                  color={isMicOn ? colors.primaryDark : "#8C2D1E"}
+                  color={isMicOn ? colors.primaryDark : "#DC0000"}
                 />
                 <Text style={styles.preToggleText}>{isMicOn ? "Mic On" : "Mic Off"}</Text>
               </Pressable>
@@ -371,7 +505,7 @@ export default function CallRoomScreen() {
                 <Ionicons
                   name={isCamOn ? "videocam" : "videocam-off"}
                   size={16}
-                  color={isCamOn ? colors.primaryDark : "#8C2D1E"}
+                  color={isCamOn ? colors.primaryDark : "#DC0000"}
                 />
                 <Text style={styles.preToggleText}>
                   {isCamOn ? "Camera On" : "Camera Off"}
@@ -407,6 +541,7 @@ export default function CallRoomScreen() {
             <Text style={styles.integrationStatus}>
               Status: {realtimeStatus.toUpperCase()} - {realtimeInfo}
             </Text>
+            <Text style={styles.integrationStatus}>Media: {mediaInfo}</Text>
           </View>
 
           <View style={styles.panel}>
@@ -459,6 +594,23 @@ export default function CallRoomScreen() {
               ? "Realtime connected"
               : "Simulation mode"}
           </Text>
+          {isRecording ? (
+            <View
+              style={styles.recordingBadge}
+              accessible
+              accessibilityRole="text"
+              accessibilityLabel={`Recording in progress. Elapsed ${formattedRecording}`}
+            >
+              <View style={styles.recordingDot} />
+              <Text style={styles.recordingBadgeText}>Recording {formattedRecording}</Text>
+            </View>
+          ) : null}
+          {isSharingScreen ? (
+            <View style={styles.sharingBadge}>
+              <Ionicons name="desktop" size={12} color="#fff" />
+              <Text style={styles.sharingBadgeText}>You are sharing your screen</Text>
+            </View>
+          ) : null}
         </View>
         <View style={styles.headerActions}>
           <Pressable
@@ -484,15 +636,31 @@ export default function CallRoomScreen() {
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.tilesWrap}
         columnWrapperStyle={tileColumns > 1 ? { gap: tileGap } : undefined}
+        ListHeaderComponent={
+          isSharingScreen && screenShareStream ? (
+            <View style={styles.shareStageWrap}>
+              <Text style={styles.shareStageLabel}>Shared Screen</Text>
+              <View style={styles.shareStage}>
+                <RTCView
+                  streamURL={screenShareStream.toURL()}
+                  style={styles.shareStageVideo}
+                  objectFit="cover"
+                  zOrder={0}
+                />
+              </View>
+            </View>
+          ) : null
+        }
         renderItem={({ item }) => {
           const isSpeaking = speakerId === item.id;
           return (
             <View
               style={[
                 styles.tile,
+                isSharingScreen && styles.tileCompact,
                 {
                   width: tileWidth,
-                  borderColor: isSpeaking ? "#7BC9AE" : "#1A2D42",
+                  borderColor: isSpeaking ? "#E8A339" : "#1A2D42",
                 },
               ]}
             >
@@ -502,6 +670,18 @@ export default function CallRoomScreen() {
                     {item.name.slice(0, 2).toUpperCase()}
                   </Text>
                 </View>
+              ) : item.isLocal && isSharingScreen ? (
+                <View style={styles.shareSelfPlaceholder}>
+                  <Ionicons name="desktop" size={18} color="#EAF3FF" />
+                  <Text style={styles.shareSelfPlaceholderText}>Sharing Screen</Text>
+                </View>
+              ) : item.isLocal && localStream ? (
+                <RTCView
+                  streamURL={localStream.toURL()}
+                  style={styles.localVideo}
+                  objectFit="cover"
+                  mirror
+                />
               ) : (
                 <View style={styles.fakeVideoSurface}>
                   <View style={styles.fakeVideoGradient} />
@@ -517,12 +697,12 @@ export default function CallRoomScreen() {
                   <Ionicons
                     name={item.isMicOn ? "mic" : "mic-off"}
                     size={12}
-                    color={item.isMicOn ? "#D8F4EA" : "#FFD5CE"}
+                    color={item.isMicOn ? "#FFEFD2" : "#FFB8B8"}
                   />
                   <Ionicons
                     name={item.isCameraOn ? "videocam" : "videocam-off"}
                     size={12}
-                    color={item.isCameraOn ? "#D8F4EA" : "#FFD5CE"}
+                    color={item.isCameraOn ? "#FFEFD2" : "#FFB8B8"}
                   />
                 </View>
               </View>
@@ -534,31 +714,99 @@ export default function CallRoomScreen() {
       <View style={styles.controlsBar}>
         <ControlButton
           icon={isMicOn ? "mic" : "mic-off"}
-          label={isMicOn ? "Mute" : "Unmute"}
+          label="Mic"
           danger={!isMicOn}
           onPress={toggleLocalMic}
+          active={isMicOn}
+          accessibilityLabel={isMicOn ? "Mute microphone" : "Unmute microphone"}
         />
         <ControlButton
           icon={isCamOn ? "videocam" : "videocam-off"}
-          label={isCamOn ? "Cam Off" : "Cam On"}
+          label="Camera"
           danger={!isCamOn}
           onPress={toggleLocalCam}
+          active={isCamOn}
+          accessibilityLabel={isCamOn ? "Turn camera off" : "Turn camera on"}
         />
         <ControlButton
           icon="share-social"
-          label={isShareRequested ? "Stop Share" : "Share"}
-          onPress={() => setIsShareRequested((prev) => !prev)}
+          label="Share"
+          onPress={() => void toggleScreenShare()}
+          active={isShareRequested}
+          accessibilityLabel={isShareRequested ? "Stop screen sharing" : "Start screen sharing"}
         />
         <ControlButton
-          icon="chatbubble-ellipses"
-          label="Chat"
-          onPress={() => setChatOpen((prev) => !prev)}
+          icon="ellipsis-horizontal"
+          label="More"
+          onPress={() => setIsMoreMenuOpen((prev) => !prev)}
+          active={isMoreMenuOpen}
+          accessibilityLabel={isMoreMenuOpen ? "Close more options" : "Open more options"}
         />
-        <Pressable style={styles.leaveBtn} onPress={leaveCall}>
-          <Ionicons name="call" size={18} color="#fff" />
-          <Text style={styles.leaveText}>Leave</Text>
-        </Pressable>
+        <ControlButton
+          icon="call"
+          label="Leave"
+          danger
+          onPress={leaveCall}
+          accessibilityLabel="Leave call"
+        />
       </View>
+
+      {isMoreMenuOpen ? (
+        <View style={styles.moreMenuOverlay}>
+          <Pressable
+            style={styles.moreMenuBackdrop}
+            onPress={() => setIsMoreMenuOpen(false)}
+            accessibilityRole="button"
+            accessibilityLabel="Close options menu"
+          />
+          <View
+            style={styles.moreMenuCard}
+            accessible
+            accessibilityRole="menu"
+            accessibilityLabel="Call options"
+          >
+            <Pressable
+              style={styles.moreMenuItem}
+              onPress={() => {
+                setChatOpen(true);
+                setIsMoreMenuOpen(false);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Open meeting chat"
+            >
+              <Ionicons name="chatbubble-ellipses" size={16} color={colors.text} />
+              <Text style={styles.moreMenuText}>Chat</Text>
+            </Pressable>
+            <Pressable
+              style={styles.moreMenuItem}
+              onPress={() => {
+                setParticipantsOpen(true);
+                setIsMoreMenuOpen(false);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Open participants list"
+            >
+              <Ionicons name="people" size={16} color={colors.text} />
+              <Text style={styles.moreMenuText}>Participants</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.moreMenuItem, isRecording && styles.moreMenuItemDanger]}
+              onPress={() => void toggleRecording()}
+              accessibilityRole="button"
+              accessibilityLabel={isRecording ? "Stop recording" : "Start recording"}
+            >
+              <Ionicons
+                name={isRecording ? "stop-circle" : "radio-button-on"}
+                size={16}
+                color={isRecording ? "#fff" : "#DC0000"}
+              />
+              <Text style={[styles.moreMenuText, isRecording && styles.moreMenuTextDanger]}>
+                {isRecording ? "Stop Recording" : "Start Recording"}
+              </Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : null}
 
       {participantsOpen ? (
         <View style={styles.panelOverlay}>
@@ -577,12 +825,12 @@ export default function CallRoomScreen() {
                     <Ionicons
                       name={p.isMicOn ? "mic" : "mic-off"}
                       size={14}
-                      color={p.isMicOn ? colors.primaryDark : "#8C2D1E"}
+                      color={p.isMicOn ? colors.primaryDark : "#DC0000"}
                     />
                     <Ionicons
                       name={p.isCameraOn ? "videocam" : "videocam-off"}
                       size={14}
-                      color={p.isCameraOn ? colors.primaryDark : "#8C2D1E"}
+                      color={p.isCameraOn ? colors.primaryDark : "#DC0000"}
                     />
                   </View>
                 </View>
@@ -658,16 +906,23 @@ function ControlButton({
   label,
   onPress,
   danger,
+  active,
+  accessibilityLabel,
 }: {
   icon: keyof typeof Ionicons.glyphMap;
   label: string;
   onPress: () => void;
   danger?: boolean;
+  active?: boolean;
+  accessibilityLabel?: string;
 }) {
   return (
     <Pressable
       onPress={onPress}
-      style={[styles.controlBtn, danger && styles.controlBtnDanger]}
+      style={[styles.controlBtn, active && styles.controlBtnActive, danger && styles.controlBtnDanger]}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel || label}
+      accessibilityState={{ selected: !!active }}
     >
       <Ionicons name={icon} size={18} color="#fff" />
       <Text style={styles.controlText}>{label}</Text>
@@ -685,7 +940,7 @@ const styles = StyleSheet.create({
     width: 300,
     height: 300,
     borderRadius: 150,
-    backgroundColor: "#D2E8DF",
+    backgroundColor: "#FFE5B7",
     top: -120,
     right: -100,
   },
@@ -786,8 +1041,8 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   preToggleMuted: {
-    backgroundColor: "#FCEBE8",
-    borderColor: "#E8C1BB",
+    backgroundColor: "#FFE5E5",
+    borderColor: "#F3A3A3",
   },
   preToggleText: {
     color: colors.text,
@@ -835,6 +1090,50 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 2,
   },
+  recordingBadge: {
+    marginTop: 6,
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    backgroundColor: "rgba(220, 0, 0, 0.15)",
+    borderWidth: 1,
+    borderColor: "#DC0000",
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  recordingDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: "#DC0000",
+  },
+  recordingBadgeText: {
+    color: "#FFE6E6",
+    fontFamily: type.body,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  sharingBadge: {
+    marginTop: 6,
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "#DC0000",
+    borderWidth: 1,
+    borderColor: "#F04A4A",
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  sharingBadgeText: {
+    color: "#fff",
+    fontFamily: type.body,
+    fontSize: 11,
+    fontWeight: "800",
+  },
   headerActions: {
     flexDirection: "row",
     gap: 8,
@@ -861,6 +1160,29 @@ const styles = StyleSheet.create({
     gap: 8,
     paddingBottom: 120,
   },
+  shareStageWrap: {
+    marginBottom: 10,
+  },
+  shareStageLabel: {
+    color: "#EAF3FF",
+    fontFamily: type.body,
+    fontSize: 12,
+    fontWeight: "800",
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+    marginBottom: 6,
+  },
+  shareStage: {
+    height: 240,
+    borderRadius: 14,
+    overflow: "hidden",
+    borderWidth: 2,
+    borderColor: "#E8A339",
+    backgroundColor: "#0C1D2F",
+  },
+  shareStageVideo: {
+    ...StyleSheet.absoluteFillObject,
+  },
   tile: {
     height: 135,
     backgroundColor: "#10243A",
@@ -869,8 +1191,28 @@ const styles = StyleSheet.create({
     overflow: "hidden",
     justifyContent: "space-between",
   },
+  tileCompact: {
+    height: 102,
+  },
   fakeVideoSurface: {
     ...StyleSheet.absoluteFillObject,
+  },
+  localVideo: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  shareSelfPlaceholder: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 6,
+  },
+  shareSelfPlaceholderText: {
+    color: "#EAF3FF",
+    fontFamily: type.body,
+    fontSize: 11,
+    fontWeight: "700",
+    letterSpacing: 0.3,
+    textTransform: "uppercase",
   },
   fakeVideoGradient: {
     flex: 1,
@@ -923,20 +1265,24 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   controlBtn: {
+    flex: 1,
     alignItems: "center",
     justifyContent: "center",
     gap: 2,
-    minWidth: 56,
-    paddingVertical: 6,
-    paddingHorizontal: 4,
+    height: 54,
+    paddingHorizontal: 2,
     borderRadius: 10,
     backgroundColor: "#203C5D",
     borderWidth: 1,
     borderColor: "#2D5279",
   },
+  controlBtnActive: {
+    borderColor: "#E8A339",
+    backgroundColor: "#274969",
+  },
   controlBtnDanger: {
-    backgroundColor: "#7B2D25",
-    borderColor: "#99463D",
+    backgroundColor: "#B30000",
+    borderColor: "#D03434",
   },
   controlText: {
     color: "#EAF3FF",
@@ -944,23 +1290,50 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: "700",
   },
-  leaveBtn: {
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 2,
-    minWidth: 64,
-    paddingVertical: 6,
-    paddingHorizontal: 8,
-    borderRadius: 10,
-    backgroundColor: "#B63A2F",
-    borderWidth: 1,
-    borderColor: "#D15B50",
+  moreMenuOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: "flex-end",
+    zIndex: 20,
   },
-  leaveText: {
-    color: "#fff",
+  moreMenuBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0, 0, 0, 0.35)",
+  },
+  moreMenuCard: {
+    position: "absolute",
+    right: 12,
+    bottom: 82,
+    minWidth: 180,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.stroke,
+    borderRadius: 12,
+    padding: 6,
+    gap: 4,
+  },
+  moreMenuItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    backgroundColor: colors.surfaceSoft,
+    borderWidth: 1,
+    borderColor: colors.stroke,
+  },
+  moreMenuItemDanger: {
+    backgroundColor: "#DC0000",
+    borderColor: "#B30000",
+  },
+  moreMenuText: {
+    color: colors.text,
     fontFamily: type.body,
-    fontSize: 10,
-    fontWeight: "800",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  moreMenuTextDanger: {
+    color: "#fff",
   },
   panelOverlay: {
     ...StyleSheet.absoluteFillObject,
@@ -1096,3 +1469,4 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 });
+

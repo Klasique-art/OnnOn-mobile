@@ -263,7 +263,7 @@ const styles = StyleSheet.create({
     width: 250,
     height: 250,
     borderRadius: 125,
-    backgroundColor: "#D7EFE4",
+    backgroundColor: "#FFEAC7",
     bottom: -100,
     left: -80,
   },
@@ -314,8 +314,8 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   contactChipActive: {
-    backgroundColor: "#EAF4F0",
-    borderColor: "#8CCDB4",
+    backgroundColor: "#FFF3DE",
+    borderColor: "#E5A535",
     width: 86,
     height: 24,
   },
@@ -426,7 +426,7 @@ const styles = StyleSheet.create({
     alignSelf: "flex-end",
   },
   myMeta: {
-    color: "#D9F2E7",
+    color: "#FFF0D6",
   },
   composerRow: {
     marginTop: 6,
@@ -466,3 +466,4 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
 });
+

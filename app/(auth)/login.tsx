@@ -151,7 +151,7 @@ const styles = StyleSheet.create({
     width: 280,
     height: 280,
     borderRadius: 140,
-    backgroundColor: "#D3EAF0",
+    backgroundColor: "#FFE9C4",
     top: -120,
     right: -100,
   },
@@ -241,3 +241,4 @@ const styles = StyleSheet.create({
     textDecorationLine: "underline",
   },
 });
+

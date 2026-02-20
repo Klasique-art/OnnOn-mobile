@@ -383,7 +383,7 @@ export default function MeetingsScreen() {
               <Switch
                 value={passwordProtected}
                 onValueChange={setPasswordProtected}
-                trackColor={{ false: "#B7C5D5", true: "#8FD1BB" }}
+                trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
                 thumbColor={passwordProtected ? colors.primary : "#EEF3F8"}
               />
             </View>
@@ -440,7 +440,7 @@ const styles = StyleSheet.create({
     width: 300,
     height: 300,
     borderRadius: 150,
-    backgroundColor: "#D6ECE3",
+    backgroundColor: "#FFE6BA",
     top: -100,
     right: -90,
   },
@@ -586,7 +586,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#E5EEF8",
   },
   statusLive: {
-    backgroundColor: "#D5F3E8",
+    backgroundColor: "#FFEBC9",
   },
   statusScheduled: {
     backgroundColor: "#E5EEF8",
@@ -810,3 +810,4 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
 });
+

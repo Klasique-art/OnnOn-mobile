@@ -102,7 +102,7 @@ const styles = StyleSheet.create({
     width: 280,
     height: 280,
     borderRadius: 140,
-    backgroundColor: "#CDEBDC",
+    backgroundColor: "#FFE7BC",
     top: -90,
     right: -70,
   },
@@ -159,3 +159,4 @@ const styles = StyleSheet.create({
     lineHeight: 23,
   },
 });
+

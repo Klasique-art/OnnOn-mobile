@@ -180,7 +180,7 @@ const styles = StyleSheet.create({
     width: 280,
     height: 280,
     borderRadius: 140,
-    backgroundColor: "#D6ECE3",
+    backgroundColor: "#FFE6BA",
     top: -90,
     right: -80,
   },
@@ -402,10 +402,10 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
   },
   statusPaid: {
-    backgroundColor: "#D5F3E8",
+    backgroundColor: "#FFEBC9",
   },
   statusFailed: {
-    backgroundColor: "#F6D8D3",
+    backgroundColor: "#FFD6D6",
   },
   statusText: {
     color: colors.text,
@@ -415,3 +415,4 @@ const styles = StyleSheet.create({
     textTransform: "uppercase",
   },
 });
+
