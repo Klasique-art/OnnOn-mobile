@@ -1,9 +1,12 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useMemo, useState, useEffect } from "react";
+import * as FileSystem from "expo-file-system/legacy";
+import * as MediaLibrary from "expo-media-library";
 import {
   Alert,
   FlatList,
   KeyboardAvoidingView,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -36,6 +39,15 @@ import {
   getScreenShareStream,
   stopStream,
 } from "@/src/calls/webrtc";
+import {
+  getMicrophonePermissionStatus,
+  requestMicrophonePermission,
+  startInAppRecording,
+  stopInAppRecording,
+  startGlobalRecording,
+  stopGlobalRecording,
+  useGlobalRecording,
+} from "react-native-nitro-screen-recorder";
 
 function makeRoomId() {
   const chars = "abcdefghijklmnopqrstuvwxyz";
@@ -74,9 +86,12 @@ export default function CallRoomScreen() {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [screenShareStream, setScreenShareStream] = useState<MediaStream | null>(null);
   const [mediaInfo, setMediaInfo] = useState("Camera and mic not started yet.");
-  const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false);
+  const { isRecording } = useGlobalRecording({
+    settledTimeMs: 1000,
+  });
+  const [lastRecordingPath, setLastRecordingPath] = useState<string | null>(null);
 
   const activeRemotePool = useMemo(
     () =>
@@ -230,23 +245,121 @@ export default function CallRoomScreen() {
     }
   };
 
+  const saveRecordingToLibrary = async (path: string) => {
+    const normalizedPath = path.startsWith("file://") ? path : `file://${path}`;
+    let isStable = false;
+    for (let i = 0; i < 6; i += 1) {
+      const info = await FileSystem.getInfoAsync(normalizedPath, { size: true });
+      if (info.exists && typeof info.size === "number" && info.size > 16_000) {
+        isStable = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+
+    if (!isStable) {
+      throw new Error("Recording file is not finalized yet.");
+    }
+
+    const permission = await MediaLibrary.requestPermissionsAsync();
+    if (!permission.granted) {
+      return { saved: false as const, path: normalizedPath };
+    }
+    await MediaLibrary.saveToLibraryAsync(normalizedPath);
+    return { saved: true as const, path: normalizedPath };
+  };
+
   const startRecording = async () => {
-    setIsRecording(true);
     setRecordingSeconds(0);
-    setMediaInfo("Recording started (local simulation).");
-    Alert.alert(
-      "Use Device Screen Recorder",
-      "For reliable recording, use your phone's built-in screen recorder from quick settings."
-    );
+    let enableMic = isMicOn;
+
+    if (enableMic && getMicrophonePermissionStatus() !== "granted") {
+      try {
+        const permission = await requestMicrophonePermission();
+        if (permission.status !== "granted") {
+          enableMic = false;
+          Alert.alert(
+            "Microphone Permission Not Granted",
+            "Screen recording will continue without microphone audio."
+          );
+        }
+      } catch {
+        enableMic = false;
+        Alert.alert(
+          "Microphone Permission Not Granted",
+          "Screen recording will continue without microphone audio."
+        );
+      }
+    }
+
+    try {
+      if (Platform.OS === "ios") {
+        await startInAppRecording({
+          options: {
+            enableMic,
+            enableCamera: false,
+          },
+          onRecordingFinished: (file) => {
+            if (file?.path) setLastRecordingPath(file.path);
+          },
+        });
+      } else {
+        startGlobalRecording({
+          options: { enableMic },
+          onRecordingError: (error) => {
+            setMediaInfo(`Recording error: ${error.message}`);
+            Alert.alert("Recording Error", error.message);
+          },
+        });
+      }
+      setMediaInfo(
+        enableMic
+          ? "Meeting recording started with microphone."
+          : "Meeting recording started without microphone."
+      );
+    } catch {
+      setMediaInfo("Unable to start screen recording on this build.");
+      Alert.alert(
+        "Recording Unavailable",
+        "Could not start recording. Rebuild this dev client after native changes."
+      );
+    }
   };
 
   const stopRecording = async () => {
-    setIsRecording(false);
-    setMediaInfo("Recording stopped (local simulation).");
-    Alert.alert(
-      "Find Your Recording",
-      "Android (Samsung): Gallery > Albums > Screen recordings\n\niOS: Photos app > Recents/Screen Recordings"
-    );
+    try {
+      const file =
+        Platform.OS === "ios"
+          ? await stopInAppRecording()
+          : await stopGlobalRecording({ settledTimeMs: 4500 });
+      if (file?.path) {
+        setLastRecordingPath(file.path);
+        const result = await saveRecordingToLibrary(file.path);
+        setMediaInfo("Recording stopped and saved.");
+        if (result.saved) {
+          Alert.alert(
+            "Recording Saved",
+            Platform.OS === "ios"
+              ? "Saved to Photos."
+              : "Saved to Gallery/Photos."
+          );
+        } else {
+          Alert.alert(
+            "Recording Saved",
+            `Saved in app storage:\n${result.path}\n\nGrant Photos/Media permission to auto-save to gallery.`
+          );
+        }
+      } else {
+        setMediaInfo("Recording stopped, but no file was returned.");
+        Alert.alert(
+          "Recording Stopped",
+          "Recording ended, but the file path was not returned."
+        );
+      }
+    } catch {
+      setMediaInfo("Unable to stop recording cleanly.");
+      Alert.alert("Stop Failed", "Could not stop recording. Please try again.");
+    }
   };
 
   const toggleRecording = async () => {
@@ -801,9 +914,17 @@ export default function CallRoomScreen() {
                 color={isRecording ? "#fff" : "#DC0000"}
               />
               <Text style={[styles.moreMenuText, isRecording && styles.moreMenuTextDanger]}>
-                {isRecording ? "Stop Recording" : "Start Recording"}
+                {isRecording ? "Stop Recording" : "Record Meeting"}
               </Text>
             </Pressable>
+            {lastRecordingPath ? (
+              <View style={styles.lastSavedWrap}>
+                <Text style={styles.lastSavedLabel}>Last saved recording</Text>
+                <Text numberOfLines={2} style={styles.lastSavedPath}>
+                  {lastRecordingPath}
+                </Text>
+              </View>
+            ) : null}
           </View>
         </View>
       ) : null}
@@ -1334,6 +1455,29 @@ const styles = StyleSheet.create({
   },
   moreMenuTextDanger: {
     color: "#fff",
+  },
+  lastSavedWrap: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.stroke,
+    backgroundColor: colors.surfaceSoft,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  lastSavedLabel: {
+    color: colors.textMuted,
+    fontFamily: type.body,
+    fontSize: 10,
+    fontWeight: "800",
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+  },
+  lastSavedPath: {
+    marginTop: 2,
+    color: colors.text,
+    fontFamily: type.body,
+    fontSize: 11,
+    fontWeight: "600",
   },
   panelOverlay: {
     ...StyleSheet.absoluteFillObject,

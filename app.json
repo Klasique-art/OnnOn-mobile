@@ -10,6 +10,7 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
+      "bundleIdentifier": "com.shopwit.OnnOn",
       "infoPlist": {
         "NSCameraUsageDescription": "OnnOn needs camera access for video meetings.",
         "NSMicrophoneUsageDescription": "OnnOn needs microphone access for meeting audio."
@@ -34,6 +35,8 @@
         "android.permission.INTERNET",
         "android.permission.MODIFY_AUDIO_SETTINGS",
         "android.permission.RECORD_AUDIO",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_VIDEO",
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION",
         "android.permission.POST_NOTIFICATIONS",
@@ -62,9 +65,23 @@
           }
         }
       ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow OnnOn to save meeting recordings to your photo library.",
+          "savePhotosPermission": "Allow OnnOn to save meeting recordings to your photo library."
+        }
+      ],
       "@react-native-community/datetimepicker",
       "@config-plugins/react-native-webrtc",
-      "./plugins/withWebRTCMediaProjection"
+      "./plugins/withWebRTCMediaProjection",
+      [
+        "react-native-nitro-screen-recorder",
+        {
+          "enableMicrophonePermission": true,
+          "showPluginLogs": false
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,
