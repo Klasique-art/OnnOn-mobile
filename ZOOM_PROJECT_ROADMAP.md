@@ -2,7 +2,7 @@
 
 ## 1) What Exists Today (Verified)
 
-I reviewed `D:\onnon-backend` and confirmed the backend already includes:
+I reviewed `C:\Users\Good\Desktop\backend\onnon-backend` and confirmed the backend already includes:
 
 - Auth APIs with JWT (`/api/users/*`) and profile bootstrap.
 - Profile APIs (`/api/profile/*`) including avatar upload.

@@ -10,9 +10,7 @@ export const LoginValidationSchema: Yup.ObjectSchema<LoginFormValues> =
     emailOrUsername: Yup.string()
       .trim()
       .required("Email or username is required"),
-    password: Yup.string()
-      .required("Password is required")
-      .min(8, "Password must be at least 8 characters"),
+    password: Yup.string().required("Password is required"),
   });
 
 export type SignupFormValues = {
@@ -37,7 +35,8 @@ export const SignupValidationSchema: Yup.ObjectSchema<SignupFormValues> =
       .min(8, "Password must be at least 8 characters")
       .matches(/[a-z]/, "Password must include a lowercase letter")
       .matches(/[A-Z]/, "Password must include an uppercase letter")
-      .matches(/[0-9]/, "Password must include a number"),
+      .matches(/[0-9]/, "Password must include a number")
+      .matches(/[^A-Za-z0-9]/, "Password must include a symbol"),
     confirmPassword: Yup.string()
       .required("Please confirm your password")
       .oneOf([Yup.ref("password")], "Passwords must match"),
