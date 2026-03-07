@@ -1,5 +1,5 @@
 import { Ionicons } from "@expo/vector-icons";
-import { Link } from "expo-router";
+import { Link, useRouter } from "expo-router";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { colors, type } from "@/src/theme/colors";
@@ -8,6 +8,7 @@ import { mockConversations } from "@/src/data/mockChat";
 import { mockProfile } from "@/src/data/mockProfile";
 
 export default function HomeScreen() {
+  const router = useRouter();
   const upcoming = mockMeetings.filter((meeting) => meeting.status !== "completed").slice(0, 3);
   const liveCount = mockMeetings.filter((meeting) => meeting.status === "live").length;
   const unreadDm = mockConversations.reduce((sum, conv) => sum + conv.unreadCount, 0);
@@ -33,12 +34,18 @@ export default function HomeScreen() {
         </View>
 
         <View style={styles.quickActions}>
-          <Link href="/(app)/call-room" asChild>
-            <Pressable style={styles.primaryAction}>
-              <Ionicons name="videocam" size={16} color={colors.primaryText} />
-              <Text style={styles.primaryActionText}>Open Call Room</Text>
-            </Pressable>
-          </Link>
+          <Pressable
+            style={styles.primaryAction}
+            onPress={() =>
+              router.push({
+                pathname: "/(app)/(tabs)/meetings",
+                params: { create: String(Date.now()) },
+              })
+            }
+          >
+            <Ionicons name="add-circle" size={16} color={colors.primaryText} />
+            <Text style={styles.primaryActionText}>Create Meeting</Text>
+          </Pressable>
           <Link href="/(app)/billing" asChild>
             <Pressable style={styles.secondaryAction}>
               <Ionicons name="card" size={16} color={colors.text} />

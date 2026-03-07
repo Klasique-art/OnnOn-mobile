@@ -42,7 +42,11 @@ const client = axios.create({
 });
 
 client.interceptors.request.use(async (config) => {
-  if (__DEV__ && config.url) {
+  const isMeetingStatePoll =
+    typeof config.url === "string" &&
+    /^\/meetings\/[^/]+\/state$/.test(config.url);
+
+  if (__DEV__ && config.url && !isMeetingStatePoll) {
     const requestBase = config.baseURL || RESOLVED_API_BASE_URL;
     console.log("[API] Request", {
       method: config.method?.toUpperCase?.() || "GET",
@@ -64,15 +68,28 @@ client.interceptors.response.use(
   (error) => {
     const method = error.config?.method?.toUpperCase?.() || "UNKNOWN";
     const url = error.config?.url || "UNKNOWN_URL";
+    const isMeetingStatePoll =
+      typeof url === "string" &&
+      /^\/meetings\/[^/]+\/state$/.test(url);
+    const isMySessionConflict =
+      method === "GET" &&
+      typeof url === "string" &&
+      /^\/meetings\/[^/]+\/me\/session$/.test(url) &&
+      error.response?.status === 409 &&
+      String(error.response?.data?.message || "")
+        .toLowerCase()
+        .includes("participant already joined");
 
-    console.error("[API] Request failed", {
-      method,
-      url,
-      message: error.message,
-      code: error.code,
-      status: error.response?.status,
-      responseData: error.response?.data,
-    });
+    if (!isMeetingStatePoll && !isMySessionConflict) {
+      console.error("[API] Request failed", {
+        method,
+        url,
+        message: error.message,
+        code: error.code,
+        status: error.response?.status,
+        responseData: error.response?.data,
+      });
+    }
 
     return Promise.reject(error);
   }

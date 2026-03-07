@@ -1,24 +1,27 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { AxiosError } from "axios";
 import * as Linking from "expo-linking";
+import { StatusBar } from "expo-status-bar";
 import {
   ActivityIndicator,
   FlatList,
-  Modal,
   Pressable,
   RefreshControl,
-  ScrollView,
   Share,
   StyleSheet,
-  Switch,
   Text,
-  TextInput,
   View,
 } from "react-native";
 
 import client from "@/lib/client";
 import AppPopup, { PopupAction, PopupTone } from "@/src/components/AppPopup";
+import CreateMeetingModal, {
+  type CreateMeetingFormValues,
+} from "@/src/components/meetings/CreateMeetingModal";
+import EditMeetingModal, {
+  type EditMeetingFormValues,
+} from "@/src/components/meetings/EditMeetingModal";
 import { colors, type } from "@/src/theme/colors";
 
 type MeetingStatus = "live" | "scheduled" | "completed";
@@ -26,6 +29,7 @@ type Filter = "all" | "live" | "scheduled";
 
 type MeetingItem = {
   id: string;
+  joinCode?: string;
   title: string;
   hostName: string;
   isHost?: boolean;
@@ -41,6 +45,35 @@ type MeetingItem = {
     allowScreenShare?: boolean;
     allowRecording?: boolean;
   };
+  links?: {
+    universal?: string;
+    deepLink?: string;
+  };
+};
+
+type RawMeetingItem = Partial<MeetingItem> & {
+  id?: string;
+  meetingId?: string;
+  joinCode?: string;
+};
+
+type CreateMeetingRequest = {
+  title: string;
+  startsAt: string;
+  timezone: string;
+  password?: string;
+  settings: {
+    waitingRoom: boolean;
+    muteOnJoin: boolean;
+    allowScreenShare: boolean;
+    allowRecording: boolean;
+  };
+};
+
+type CreateMeetingResponse = {
+  success: boolean;
+  message?: string;
+  data: RawMeetingItem;
 };
 
 type Pagination = {
@@ -56,7 +89,7 @@ type MeetingsResponse = {
   success: boolean;
   message?: string;
   data: {
-    items: MeetingItem[];
+    items: RawMeetingItem[];
     pagination: Pagination;
     serverTime?: string;
   };
@@ -67,11 +100,71 @@ type ApiErrorResponse = {
   message?: string;
 };
 
+type SubscriptionEntitlements = {
+  recording?: boolean;
+  screenShare?: boolean;
+};
+
+type SubscriptionResponse = {
+  success: boolean;
+  data?: {
+    entitlements?: SubscriptionEntitlements;
+  };
+};
+
 const PAGE_LIMIT = 20;
 const APP_LINK_BASE_URL = "https://onnon.app";
+const DETECTED_TIMEZONE =
+  Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+
+const getDefaultCreateForm = (timezone: string): CreateMeetingFormValues => ({
+  title: "",
+  startsNow: true,
+  startsAt: new Date(),
+  timezone,
+  password: "",
+  waitingRoom: true,
+  muteOnJoin: true,
+  allowScreenShare: true,
+  allowRecording: false,
+});
+const getDefaultEditForm = (): EditMeetingFormValues => ({
+  title: "",
+  password: "",
+  waitingRoom: false,
+  muteOnJoin: true,
+  allowScreenShare: true,
+  allowRecording: false,
+});
+
+const normalizeMeeting = (raw: RawMeetingItem): MeetingItem => ({
+  id: raw.id || raw.meetingId || "",
+  joinCode: raw.joinCode,
+  title: raw.title || "Untitled Meeting",
+  hostName: raw.hostName || "Host",
+  isHost: raw.isHost,
+  startsAt: raw.startsAt || new Date().toISOString(),
+  durationMinutes:
+    typeof raw.durationMinutes === "number" && Number.isFinite(raw.durationMinutes)
+      ? raw.durationMinutes
+      : 30,
+  participantCount:
+    typeof raw.participantCount === "number" && Number.isFinite(raw.participantCount)
+      ? raw.participantCount
+      : 0,
+  maxParticipants:
+    typeof raw.maxParticipants === "number" && Number.isFinite(raw.maxParticipants)
+      ? raw.maxParticipants
+      : 25,
+  passwordProtected: Boolean(raw.passwordProtected),
+  status: (raw.status as MeetingStatus) || "scheduled",
+  settings: raw.settings,
+  links: raw.links,
+});
 
 export default function MeetingsScreen() {
   const router = useRouter();
+  const { create } = useLocalSearchParams<{ create?: string | string[] }>();
   const [meetings, setMeetings] = useState<MeetingItem[]>([]);
   const [filter, setFilter] = useState<Filter>("all");
   const [viewerDisplayName, setViewerDisplayName] = useState<string>("");
@@ -82,13 +175,16 @@ export default function MeetingsScreen() {
   const [screenError, setScreenError] = useState<string | null>(null);
   const [isEditOpen, setIsEditOpen] = useState(false);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [isCreatingMeeting, setIsCreatingMeeting] = useState(false);
   const [editingMeeting, setEditingMeeting] = useState<MeetingItem | null>(null);
-  const [editTitle, setEditTitle] = useState("");
-  const [editPassword, setEditPassword] = useState("");
-  const [editWaitingRoom, setEditWaitingRoom] = useState(false);
-  const [editMuteOnJoin, setEditMuteOnJoin] = useState(true);
-  const [editAllowScreenShare, setEditAllowScreenShare] = useState(true);
-  const [editAllowRecording, setEditAllowRecording] = useState(false);
+  const [detectedTimezone, setDetectedTimezone] = useState(DETECTED_TIMEZONE);
+  const [canUseRecording, setCanUseRecording] = useState(false);
+  const [canUseScreenShare, setCanUseScreenShare] = useState(true);
+  const [createForm, setCreateForm] = useState<CreateMeetingFormValues>(
+    () => getDefaultCreateForm(DETECTED_TIMEZONE)
+  );
+  const [editForm, setEditForm] = useState<EditMeetingFormValues>(getDefaultEditForm);
   const [popupTitle, setPopupTitle] = useState("");
   const [popupMessage, setPopupMessage] = useState("");
   const [popupTone, setPopupTone] = useState<PopupTone>("info");
@@ -96,6 +192,10 @@ export default function MeetingsScreen() {
     { label: "OK", variant: "primary" },
   ]);
   const [isPopupVisible, setIsPopupVisible] = useState(false);
+  const shouldAutoOpenCreate = useMemo(() => {
+    const value = Array.isArray(create) ? create[0] : create;
+    return Boolean(value && value !== "0" && value !== "false");
+  }, [create]);
 
   const fetchMeetings = useCallback(
     async (page: number, mode: "initial" | "refresh" | "loadMore") => {
@@ -115,7 +215,7 @@ export default function MeetingsScreen() {
 
         const response = await client.get<MeetingsResponse>("/meetings", { params });
         const payload = response.data.data;
-        const nextItems = payload?.items ?? [];
+        const nextItems = (payload?.items ?? []).map(normalizeMeeting);
 
         setMeetings((prev) => (page === 1 ? nextItems : [...prev, ...nextItems]));
         setPagination(payload?.pagination ?? null);
@@ -144,6 +244,55 @@ export default function MeetingsScreen() {
   useEffect(() => {
     fetchMeetings(1, "initial");
   }, [fetchMeetings]);
+
+  useEffect(() => {
+    if (!shouldAutoOpenCreate) return;
+    setCreateForm({
+      ...getDefaultCreateForm(detectedTimezone),
+      allowRecording: canUseRecording,
+      allowScreenShare: canUseScreenShare,
+    });
+    setIsCreateOpen(true);
+    router.setParams({ create: undefined });
+  }, [canUseRecording, canUseScreenShare, detectedTimezone, router, shouldAutoOpenCreate]);
+
+  useEffect(() => {
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    setDetectedTimezone(timezone);
+  }, []);
+
+  useEffect(() => {
+    const loadMeetingEntitlements = async () => {
+      try {
+        const response = await client.get<SubscriptionResponse>("/payments/subscription");
+        const entitlements = response.data?.data?.entitlements;
+        const recording = Boolean(entitlements?.recording);
+        const screenShare =
+          typeof entitlements?.screenShare === "boolean"
+            ? entitlements.screenShare
+            : true;
+
+        setCanUseRecording(recording);
+        setCanUseScreenShare(screenShare);
+        setCreateForm((prev) => ({
+          ...prev,
+          allowRecording: recording ? prev.allowRecording : false,
+          allowScreenShare: screenShare ? prev.allowScreenShare : false,
+        }));
+      } catch (err) {
+        const apiError = err as AxiosError<ApiErrorResponse>;
+        console.error("[Meetings] Failed to load meeting entitlements", {
+          message: apiError?.message || String(err),
+          code: apiError?.code,
+          status: apiError?.response?.status,
+          responseData: apiError?.response?.data,
+        });
+        setCanUseRecording(false);
+      }
+    };
+
+    void loadMeetingEntitlements();
+  }, []);
 
   useEffect(() => {
     const loadViewerProfile = async () => {
@@ -221,31 +370,35 @@ export default function MeetingsScreen() {
   };
 
   const onJoinMeeting = (meeting: MeetingItem) => {
+    const roomCode = meeting.joinCode || meeting.id;
     router.push({
       pathname: "/(app)/call-room",
-      params: { meetingId: meeting.id, title: meeting.title },
+      params: { meetingId: roomCode, title: meeting.title },
     });
   };
 
   const onShareScheduledMeeting = async (meeting: MeetingItem) => {
-    const deepLink = Linking.createURL(`/meeting/${meeting.id}`, {
+    const roomCode = meeting.joinCode || meeting.id;
+    const deepLink = meeting.links?.deepLink || Linking.createURL(`/meeting/${roomCode}`, {
       queryParams: { title: meeting.title },
     });
-    const universalLink = `${APP_LINK_BASE_URL}/meeting/${encodeURIComponent(
-      meeting.id
-    )}?title=${encodeURIComponent(meeting.title)}`;
+    const universalLink =
+      meeting.links?.universal ||
+      `${APP_LINK_BASE_URL}/meeting/${encodeURIComponent(
+        roomCode
+      )}?title=${encodeURIComponent(meeting.title)}`;
 
     try {
       await Share.share({
         title: "Share Meeting",
-        message: `Join my OnnOn meeting: ${meeting.title}\nMeeting ID: ${meeting.id}\nOpen: ${universalLink}\nApp link: ${deepLink}`,
+        message: `Join my OnnOn meeting: ${meeting.title}\nMeeting code: ${roomCode}\nOpen: ${universalLink}\nApp link: ${deepLink}`,
         url: universalLink,
       });
     } catch (err) {
       const apiError = err as Error;
       console.error("[Meetings] Failed to share meeting link", {
         message: apiError?.message || String(err),
-        meetingId: meeting.id,
+        meetingId: roomCode,
         universalLink,
         deepLink,
       });
@@ -279,6 +432,147 @@ export default function MeetingsScreen() {
     setIsPopupVisible(false);
   };
 
+  const openCreateMeeting = () => {
+    setCreateForm({
+      ...getDefaultCreateForm(detectedTimezone),
+      allowRecording: canUseRecording,
+      allowScreenShare: canUseScreenShare,
+    });
+    setIsCreateOpen(true);
+  };
+
+  const closeCreateMeeting = () => {
+    if (isCreatingMeeting) return;
+    setIsCreateOpen(false);
+    setCreateForm({
+      ...getDefaultCreateForm(detectedTimezone),
+      allowRecording: canUseRecording,
+      allowScreenShare: canUseScreenShare,
+    });
+  };
+
+  const patchCreateForm = (patch: Partial<CreateMeetingFormValues>) => {
+    setCreateForm((prev) => ({
+      ...prev,
+      ...patch,
+      allowRecording:
+        canUseRecording && typeof patch.allowRecording === "boolean"
+          ? patch.allowRecording
+          : patch.allowRecording === undefined
+          ? prev.allowRecording
+          : false,
+      allowScreenShare:
+        canUseScreenShare && typeof patch.allowScreenShare === "boolean"
+          ? patch.allowScreenShare
+          : patch.allowScreenShare === undefined
+          ? prev.allowScreenShare
+          : false,
+    }));
+  };
+
+  const patchEditForm = (patch: Partial<EditMeetingFormValues>) => {
+    setEditForm((prev) => ({ ...prev, ...patch }));
+  };
+
+  const submitCreateMeeting = async () => {
+    const trimmedTitle = createForm.title.trim();
+    const trimmedTimezone = createForm.timezone.trim();
+    const startsAtDate = createForm.startsNow ? new Date() : createForm.startsAt;
+
+    if (!trimmedTitle) {
+      showPopup({
+        title: "Validation",
+        message: "Meeting title is required.",
+        tone: "danger",
+      });
+      return;
+    }
+
+    if (Number.isNaN(startsAtDate.getTime())) {
+      showPopup({
+        title: "Validation",
+        message: "Please select a valid start date and time.",
+        tone: "danger",
+      });
+      return;
+    }
+
+    if (!trimmedTimezone) {
+      showPopup({
+        title: "Validation",
+        message: "Timezone is required.",
+        tone: "danger",
+      });
+      return;
+    }
+
+    const payload: CreateMeetingRequest = {
+      title: trimmedTitle,
+      startsAt: startsAtDate.toISOString(),
+      timezone: trimmedTimezone,
+      password: createForm.password.trim(),
+      settings: {
+        waitingRoom: createForm.waitingRoom,
+        muteOnJoin: createForm.muteOnJoin,
+        allowScreenShare: canUseScreenShare ? createForm.allowScreenShare : false,
+        allowRecording: canUseRecording ? createForm.allowRecording : false,
+      },
+    };
+
+    try {
+      setIsCreatingMeeting(true);
+      let response: { data: CreateMeetingResponse };
+      try {
+        response = await client.post<CreateMeetingResponse>("/meetings/create", payload);
+      } catch (err) {
+        const apiError = err as AxiosError<ApiErrorResponse>;
+        const isRouteMismatch =
+          apiError?.response?.status === 404 &&
+          apiError?.response?.data?.message?.toLowerCase?.().includes("route not found");
+        if (!isRouteMismatch) throw err;
+        response = await client.post<CreateMeetingResponse>("/meetings", payload);
+      }
+      const created = normalizeMeeting(response.data.data);
+      setMeetings((prev) => [created, ...prev]);
+      setPagination((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          totalItems: prev.totalItems + 1,
+        };
+      });
+      closeCreateMeeting();
+      if (createForm.startsNow) {
+        const roomCode = created.joinCode || created.id;
+        router.push({
+          pathname: "/(app)/call-room",
+          params: { meetingId: roomCode, title: created.title, created: "1" },
+        });
+      } else {
+        showPopup({
+          title: "Meeting Scheduled",
+          message: "Your meeting has been scheduled.",
+          tone: "success",
+        });
+      }
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      console.error("[Meetings] Failed to create meeting", {
+        message: apiError?.message || String(err),
+        code: apiError?.code,
+        status: apiError?.response?.status,
+        responseData: apiError?.response?.data,
+      });
+      showPopup({
+        title: "Create Failed",
+        message: apiError?.response?.data?.message || "Could not schedule meeting.",
+        tone: "danger",
+      });
+    } finally {
+      setIsCreatingMeeting(false);
+    }
+  };
+
   const onEndMeeting = (meeting: MeetingItem) => {
     showPopup({
       title: "End Meeting",
@@ -292,9 +586,22 @@ export default function MeetingsScreen() {
         {
           label: "End",
           variant: "danger",
-          onPress: () => {
-            // Local UI update until dedicated end-meeting endpoint is connected.
-            setMeetings((prev) => prev.filter((item) => item.id !== meeting.id));
+          onPress: async () => {
+            try {
+              await client.post(`/meetings/${meeting.id}/end`, {
+                reason: "host_ended",
+              });
+              setMeetings((prev) => prev.filter((item) => item.id !== meeting.id));
+            } catch (err) {
+              const apiError = err as AxiosError<ApiErrorResponse>;
+              showPopup({
+                title: "End Failed",
+                message:
+                  apiError?.response?.data?.message ||
+                  "Could not end this meeting right now.",
+                tone: "danger",
+              });
+            }
           },
         },
       ],
@@ -303,12 +610,14 @@ export default function MeetingsScreen() {
 
   const openEditMeeting = (meeting: MeetingItem) => {
     setEditingMeeting(meeting);
-    setEditTitle(meeting.title || "");
-    setEditPassword(meeting.passwordProtected ? "" : "");
-    setEditWaitingRoom(Boolean(meeting.settings?.waitingRoom));
-    setEditMuteOnJoin(meeting.settings?.muteOnJoin ?? true);
-    setEditAllowScreenShare(meeting.settings?.allowScreenShare ?? true);
-    setEditAllowRecording(Boolean(meeting.settings?.allowRecording));
+    setEditForm({
+      title: meeting.title || "",
+      password: "",
+      waitingRoom: Boolean(meeting.settings?.waitingRoom),
+      muteOnJoin: meeting.settings?.muteOnJoin ?? true,
+      allowScreenShare: meeting.settings?.allowScreenShare ?? true,
+      allowRecording: Boolean(meeting.settings?.allowRecording),
+    });
     setIsEditOpen(true);
   };
 
@@ -316,13 +625,12 @@ export default function MeetingsScreen() {
     if (isSavingEdit) return;
     setIsEditOpen(false);
     setEditingMeeting(null);
-    setEditTitle("");
-    setEditPassword("");
+    setEditForm(getDefaultEditForm());
   };
 
   const submitEditMeeting = async () => {
     if (!editingMeeting) return;
-    const trimmedTitle = editTitle.trim();
+    const trimmedTitle = editForm.title.trim();
     if (!trimmedTitle) {
       showPopup({
         title: "Validation",
@@ -336,12 +644,12 @@ export default function MeetingsScreen() {
       setIsSavingEdit(true);
       await client.put(`/meetings/${editingMeeting.id}`, {
         title: trimmedTitle,
-        password: editPassword,
+        password: editForm.password,
         settings: {
-          waitingRoom: editWaitingRoom,
-          muteOnJoin: editMuteOnJoin,
-          allowScreenShare: editAllowScreenShare,
-          allowRecording: editAllowRecording,
+          waitingRoom: editForm.waitingRoom,
+          muteOnJoin: editForm.muteOnJoin,
+          allowScreenShare: editForm.allowScreenShare,
+          allowRecording: editForm.allowRecording,
         },
       });
 
@@ -351,12 +659,12 @@ export default function MeetingsScreen() {
             ? {
                 ...meeting,
                 title: trimmedTitle,
-                passwordProtected: editPassword.trim().length > 0,
+                passwordProtected: editForm.password.trim().length > 0,
                 settings: {
-                  waitingRoom: editWaitingRoom,
-                  muteOnJoin: editMuteOnJoin,
-                  allowScreenShare: editAllowScreenShare,
-                  allowRecording: editAllowRecording,
+                  waitingRoom: editForm.waitingRoom,
+                  muteOnJoin: editForm.muteOnJoin,
+                  allowScreenShare: editForm.allowScreenShare,
+                  allowRecording: editForm.allowRecording,
                 },
               }
             : meeting
@@ -389,13 +697,21 @@ export default function MeetingsScreen() {
 
   return (
     <View style={styles.screen}>
+      <StatusBar style="light" />
       <View style={styles.bgOrbTop} />
       <View style={styles.bgOrbBottom} />
 
       <View style={styles.header}>
-        <Text style={styles.kicker}>Meetings</Text>
-        <Text style={styles.title}>Plan, start, and manage sessions</Text>
-        <Text style={styles.subtitle}>Synced with backend meetings API.</Text>
+        <View style={styles.headerTopRow}>
+          <View style={styles.headerTextWrap}>
+            <Text style={styles.kicker}>Meetings</Text>
+            <Text style={styles.title}>Plan, start, and manage sessions</Text>
+            <Text style={styles.subtitle}>Synced with backend meetings API.</Text>
+          </View>
+          <Pressable style={styles.headerCta} onPress={openCreateMeeting}>
+            <Text style={styles.headerCtaText}>Create</Text>
+          </Pressable>
+        </View>
       </View>
 
       <View style={styles.statsRow}>
@@ -540,105 +856,25 @@ export default function MeetingsScreen() {
         />
       )}
 
-      <Modal
+      <CreateMeetingModal
+        visible={isCreateOpen}
+        isSubmitting={isCreatingMeeting}
+        values={createForm}
+        canUseRecording={canUseRecording}
+        canUseScreenShare={canUseScreenShare}
+        onChange={patchCreateForm}
+        onClose={closeCreateMeeting}
+        onSubmit={submitCreateMeeting}
+      />
+
+      <EditMeetingModal
         visible={isEditOpen}
-        animationType="slide"
-        transparent
-        onRequestClose={closeEditMeeting}
-      >
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalCard}>
-            <ScrollView contentContainerStyle={styles.modalContent}>
-              <Text style={styles.modalTitle}>Edit Scheduled Meeting</Text>
-              <Text style={styles.modalHint}>
-                Leave password empty to remove password protection.
-              </Text>
-
-              <Text style={styles.fieldLabel}>Title</Text>
-              <TextInput
-                style={styles.input}
-                value={editTitle}
-                onChangeText={setEditTitle}
-                placeholder="Meeting title"
-                placeholderTextColor={colors.textMuted}
-                editable={!isSavingEdit}
-              />
-
-              <Text style={styles.fieldLabel}>Password</Text>
-              <TextInput
-                style={styles.input}
-                value={editPassword}
-                onChangeText={setEditPassword}
-                placeholder="Set password or leave empty"
-                placeholderTextColor={colors.textMuted}
-                editable={!isSavingEdit}
-                autoCapitalize="none"
-                autoCorrect={false}
-              />
-
-              <View style={styles.toggleRow}>
-                <Text style={styles.toggleLabel}>Waiting Room</Text>
-                <Switch
-                  value={editWaitingRoom}
-                  onValueChange={setEditWaitingRoom}
-                  disabled={isSavingEdit}
-                  trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
-                  thumbColor={editWaitingRoom ? colors.primary : "#EEF3F8"}
-                />
-              </View>
-              <View style={styles.toggleRow}>
-                <Text style={styles.toggleLabel}>Mute On Join</Text>
-                <Switch
-                  value={editMuteOnJoin}
-                  onValueChange={setEditMuteOnJoin}
-                  disabled={isSavingEdit}
-                  trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
-                  thumbColor={editMuteOnJoin ? colors.primary : "#EEF3F8"}
-                />
-              </View>
-              <View style={styles.toggleRow}>
-                <Text style={styles.toggleLabel}>Allow Screen Share</Text>
-                <Switch
-                  value={editAllowScreenShare}
-                  onValueChange={setEditAllowScreenShare}
-                  disabled={isSavingEdit}
-                  trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
-                  thumbColor={editAllowScreenShare ? colors.primary : "#EEF3F8"}
-                />
-              </View>
-              <View style={styles.toggleRow}>
-                <Text style={styles.toggleLabel}>Allow Recording</Text>
-                <Switch
-                  value={editAllowRecording}
-                  onValueChange={setEditAllowRecording}
-                  disabled={isSavingEdit}
-                  trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
-                  thumbColor={editAllowRecording ? colors.primary : "#EEF3F8"}
-                />
-              </View>
-
-              <View style={styles.modalActions}>
-                <Pressable
-                  style={styles.modalCancelBtn}
-                  onPress={closeEditMeeting}
-                  disabled={isSavingEdit}
-                >
-                  <Text style={styles.modalCancelText}>Cancel</Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.modalSaveBtn, isSavingEdit && styles.modalSaveBtnDisabled]}
-                  onPress={submitEditMeeting}
-                  disabled={isSavingEdit}
-                >
-                  <Text style={styles.modalSaveText}>
-                    {isSavingEdit ? "Saving..." : "Save"}
-                  </Text>
-                </Pressable>
-              </View>
-            </ScrollView>
-          </View>
-        </View>
-      </Modal>
+        isSubmitting={isSavingEdit}
+        values={editForm}
+        onChange={patchEditForm}
+        onClose={closeEditMeeting}
+        onSubmit={submitEditMeeting}
+      />
 
       <AppPopup
         visible={isPopupVisible}
@@ -680,6 +916,15 @@ const styles = StyleSheet.create({
   header: {
     marginBottom: 14,
   },
+  headerTopRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  headerTextWrap: {
+    flex: 1,
+  },
   kicker: {
     color: colors.info,
     fontFamily: type.body,
@@ -700,6 +945,23 @@ const styles = StyleSheet.create({
     fontFamily: type.body,
     fontSize: 14,
     marginTop: 4,
+  },
+  headerCta: {
+    backgroundColor: colors.primary,
+    borderWidth: 1,
+    borderColor: colors.primaryDark,
+    borderRadius: 12,
+    paddingVertical: 9,
+    paddingHorizontal: 14,
+    marginTop: 2,
+  },
+  headerCtaText: {
+    color: colors.primaryText,
+    fontFamily: type.body,
+    fontSize: 13,
+    fontWeight: "800",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
   },
   statsRow: {
     flexDirection: "row",
@@ -915,103 +1177,5 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     fontFamily: type.body,
     fontSize: 12,
-  },
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: "rgba(7, 17, 27, 0.5)",
-    justifyContent: "flex-end",
-  },
-  modalCard: {
-    backgroundColor: colors.surface,
-    borderTopLeftRadius: 22,
-    borderTopRightRadius: 22,
-    maxHeight: "90%",
-  },
-  modalContent: {
-    padding: 18,
-    gap: 8,
-  },
-  modalTitle: {
-    color: colors.text,
-    fontFamily: type.display,
-    fontSize: 28,
-    lineHeight: 34,
-  },
-  modalHint: {
-    color: colors.textMuted,
-    fontFamily: type.body,
-    fontSize: 13,
-    marginBottom: 6,
-  },
-  fieldLabel: {
-    color: colors.textMuted,
-    fontFamily: type.body,
-    fontSize: 12,
-    fontWeight: "800",
-    letterSpacing: 0.6,
-    textTransform: "uppercase",
-    marginTop: 4,
-  },
-  input: {
-    borderWidth: 1,
-    borderColor: colors.stroke,
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 11,
-    backgroundColor: colors.surfaceSoft,
-    color: colors.text,
-    fontFamily: type.body,
-    fontSize: 14,
-  },
-  toggleRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingVertical: 4,
-  },
-  toggleLabel: {
-    color: colors.text,
-    fontFamily: type.body,
-    fontSize: 14,
-    fontWeight: "600",
-  },
-  modalActions: {
-    flexDirection: "row",
-    gap: 10,
-    marginTop: 8,
-    marginBottom: 6,
-  },
-  modalCancelBtn: {
-    flex: 1,
-    backgroundColor: colors.surfaceSoft,
-    borderColor: colors.stroke,
-    borderWidth: 1,
-    borderRadius: 12,
-    paddingVertical: 12,
-    alignItems: "center",
-  },
-  modalCancelText: {
-    color: colors.text,
-    fontFamily: type.body,
-    fontSize: 14,
-    fontWeight: "700",
-  },
-  modalSaveBtn: {
-    flex: 1,
-    backgroundColor: colors.primary,
-    borderColor: colors.primaryDark,
-    borderWidth: 1,
-    borderRadius: 12,
-    paddingVertical: 12,
-    alignItems: "center",
-  },
-  modalSaveBtnDisabled: {
-    opacity: 0.6,
-  },
-  modalSaveText: {
-    color: colors.primaryText,
-    fontFamily: type.body,
-    fontSize: 14,
-    fontWeight: "700",
   },
 });

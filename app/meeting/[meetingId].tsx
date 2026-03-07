@@ -20,6 +20,7 @@ export default function MeetingShareRoute() {
         params: {
           meetingId: resolvedMeetingId,
           title: resolvedTitle || "",
+          invite: "1",
         },
       }}
     />

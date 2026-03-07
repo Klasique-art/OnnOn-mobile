@@ -1,10 +1,14 @@
 import { Ionicons } from "@expo/vector-icons";
-import { useMemo, useState, useEffect } from "react";
+import { useCallback, useMemo, useState, useEffect, useRef } from "react";
 import { useLocalSearchParams } from "expo-router";
+import { AxiosError } from "axios";
+import Constants from "expo-constants";
 import * as FileSystem from "expo-file-system/legacy";
 import * as MediaLibrary from "expo-media-library";
 import {
   Alert,
+  AppState,
+  type AppStateStatus,
   FlatList,
   KeyboardAvoidingView,
   Platform,
@@ -15,26 +19,13 @@ import {
   TextInput,
   useWindowDimensions,
   View,
+  Linking,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { RTCView, type MediaStream } from "react-native-webrtc";
 import ScreenNav from "@/src/components/ScreenNav";
+import client from "@/lib/client";
 import { colors, type } from "@/src/theme/colors";
-import { hasRealtimeConfig, runtimeConfig } from "@/src/config/runtime";
-import {
-  CallChatMessage,
-  CallParticipant,
-  callChatReplies,
-  remoteParticipantPool,
-} from "@/src/data/mockCall";
-import { socketManager } from "@/src/realtime/socket";
-import { getRouterCapabilities } from "@/src/realtime/mediasoup.socket";
-import {
-  joinRoom,
-  leaveRoom,
-  onRoomMessage,
-  sendRoomMessage,
-} from "@/src/realtime/room.socket";
 import {
   getLocalMediaStream,
   getScreenShareStream,
@@ -50,25 +41,193 @@ import {
   useGlobalRecording,
 } from "react-native-nitro-screen-recorder";
 
-function makeRoomId() {
-  const chars = "abcdefghijklmnopqrstuvwxyz";
-  const seg = () =>
-    Array.from({ length: 3 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
-  return `${seg()}-${seg()}-${seg()}`;
-}
+type ApiErrorResponse = {
+  success?: boolean;
+  message?: string;
+};
+
+type CallParticipant = {
+  id: string;
+  name: string;
+  isHost: boolean;
+  isLocal: boolean;
+  isMicOn: boolean;
+  isCameraOn: boolean;
+};
+
+type CallChatMessage = {
+  id: string;
+  senderId: string;
+  senderName: string;
+  text: string;
+  sentAt: string;
+  mine: boolean;
+};
+
+type InvitePreviewResponse = {
+  success: boolean;
+  data: {
+    meetingId: string;
+    title: string;
+    hostName: string;
+    startsAt: string;
+    status: "live" | "scheduled" | "completed";
+    requiresPassword: boolean;
+    settings?: {
+      waitingRoom?: boolean;
+      muteOnJoin?: boolean;
+    };
+  };
+};
+
+type JoinMeetingRequest = {
+  displayName: string;
+  password?: string;
+  preJoin: {
+    micOn: boolean;
+    cameraOn: boolean;
+  };
+  device: {
+    platform: string;
+    appVersion: string;
+  };
+};
+
+type JoinMeetingResponse = {
+  success: boolean;
+  message?: string;
+  data?: MyMeetingSession;
+};
+
+type MyMeetingSession = {
+  meetingId?: string;
+  participantId?: string;
+  role?: "host" | "attendee";
+  status?: string;
+  waitingRoom?: boolean;
+  session?: {
+    token?: string;
+    expiresAt?: string;
+  };
+  effective?: {
+    micOn?: boolean;
+    cameraOn?: boolean;
+  };
+  capabilities?: {
+    canUnmuteSelf?: boolean;
+    canStartVideo?: boolean;
+    canScreenShare?: boolean;
+    canRecord?: boolean;
+    maxParticipants?: number;
+  };
+};
+
+type MySessionResponse = {
+  success: boolean;
+  data?: MyMeetingSession;
+};
+
+type MeetingStateResponse = {
+  success: boolean;
+  data?: {
+    meetingId: string;
+    title: string;
+    status: "live" | "scheduled" | "completed";
+    participants: {
+      id: string;
+      displayName: string;
+      isHost: boolean;
+      isMicOn: boolean;
+      isCameraOn: boolean;
+    }[];
+    settings?: {
+      waitingRoom?: boolean;
+      muteOnJoin?: boolean;
+      allowScreenShare?: boolean;
+      allowRecording?: boolean;
+    };
+  };
+};
+
+type ParticipantMediaUpdateResponse = {
+  success: boolean;
+  data?: {
+    participantId?: string;
+    isMicOn?: boolean;
+    isCameraOn?: boolean;
+    micOn?: boolean;
+    cameraOn?: boolean;
+  };
+};
+
+type LeaveMeetingResponse = {
+  success: boolean;
+  message?: string;
+};
+
+type MeetingChatMessageResponse = {
+  success: boolean;
+  data?: {
+    id: string;
+    senderId: string;
+    senderName: string;
+    text: string;
+    sentAt: string;
+  };
+};
+
+type MeetingChatHistoryResponse = {
+  success: boolean;
+  data?: {
+    items: {
+      id: string;
+      senderId: string;
+      senderName: string;
+      text: string;
+      sentAt: string;
+    }[];
+  };
+};
+
+type ProfileResponse = {
+  success: boolean;
+  data?: {
+    displayName?: string;
+  };
+};
+
+type SubscriptionResponse = {
+  success: boolean;
+  data?: {
+    entitlements?: {
+      recording?: boolean;
+    };
+  };
+};
+
+const ROOM_STATE_POLL_INTERVAL_MS = 10000;
 
 export default function CallRoomScreen() {
-  const { meetingId, title } = useLocalSearchParams<{
+  const { meetingId, title, invite, created } = useLocalSearchParams<{
     meetingId?: string | string[];
     title?: string | string[];
+    invite?: string | string[];
+    created?: string | string[];
   }>();
   const { width } = useWindowDimensions();
   const [phase, setPhase] = useState<"lobby" | "inCall">("lobby");
 
   const [callTitle, setCallTitle] = useState("Weekly Product Sync");
-  const [displayName, setDisplayName] = useState("You");
+  const [displayName, setDisplayName] = useState("Participant");
   const [joinRoomId, setJoinRoomId] = useState("");
+  const [joinPassword, setJoinPassword] = useState("");
+  const [inviteRequiresPassword, setInviteRequiresPassword] = useState(false);
+  const [isResolvingInvite, setIsResolvingInvite] = useState(false);
+  const [isJoiningMeeting, setIsJoiningMeeting] = useState(false);
+  const [isLeavingMeeting, setIsLeavingMeeting] = useState(false);
   const [roomId, setRoomId] = useState("");
+  const [localParticipantId, setLocalParticipantId] = useState<string | null>(null);
+  const [localRole, setLocalRole] = useState<"host" | "attendee">("host");
 
   const [participants, setParticipants] = useState<CallParticipant[]>([]);
   const [speakerId, setSpeakerId] = useState<string | null>(null);
@@ -82,21 +241,28 @@ export default function CallRoomScreen() {
   const [isCamOn, setIsCamOn] = useState(true);
   const [isShareRequested, setIsShareRequested] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [authToken, setAuthToken] = useState("");
-  const [enableRealtime, setEnableRealtime] = useState(false);
-  const [realtimeStatus, setRealtimeStatus] = useState<
-    "idle" | "connecting" | "connected" | "failed"
-  >("idle");
-  const [realtimeInfo, setRealtimeInfo] = useState("Simulation mode active");
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [screenShareStream, setScreenShareStream] = useState<MediaStream | null>(null);
   const [mediaInfo, setMediaInfo] = useState("Camera and mic not started yet.");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false);
+  const [canUseRecording, setCanUseRecording] = useState(false);
+  const [canUnmuteSelf, setCanUnmuteSelf] = useState(true);
+  const [canStartVideo, setCanStartVideo] = useState(true);
+  const [canScreenShare, setCanScreenShare] = useState(true);
   const { isRecording } = useGlobalRecording({
     settledTimeMs: 1000,
   });
   const [lastRecordingPath, setLastRecordingPath] = useState<string | null>(null);
+  const roomIdRef = useRef("");
+  const phaseRef = useRef<"lobby" | "inCall">("lobby");
+  const isPollingStateRef = useRef(false);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const screenShareStreamRef = useRef<MediaStream | null>(null);
+  const isRecordingRef = useRef(false);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+  const meetingEndedRef = useRef(false);
+  const joinInFlightRef = useRef(false);
 
   const sharedMeetingId = useMemo(
     () => (Array.isArray(meetingId) ? meetingId[0] : meetingId),
@@ -106,14 +272,19 @@ export default function CallRoomScreen() {
     () => (Array.isArray(title) ? title[0] : title),
     [title]
   );
-
-  const activeRemotePool = useMemo(
-    () =>
-      remoteParticipantPool.filter(
-        (person) => !participants.some((p) => p.name === person.name)
-      ),
-    [participants]
+  const sharedInvite = useMemo(
+    () => (Array.isArray(invite) ? invite[0] : invite),
+    [invite]
   );
+  const sharedCreated = useMemo(
+    () => (Array.isArray(created) ? created[0] : created),
+    [created]
+  );
+  const isInviteFlow = sharedInvite === "1";
+  const isCreatedFlow = sharedCreated === "1";
+  const isSingleParticipantView = participants.length <= 1;
+  const isMicPreJoinLocked = !isMicOn && !canUnmuteSelf;
+  const isCamPreJoinLocked = !isCamOn && !canStartVideo;
 
   const tileColumns = useMemo(() => {
     const count = participants.length || 1;
@@ -125,19 +296,68 @@ export default function CallRoomScreen() {
 
   const tileGap = 8;
   const tileWidth = useMemo(() => {
+    if (isSingleParticipantView) {
+      return Math.min(width - 28, 420);
+    }
     const horizontalPadding = 20;
     const totalGap = tileGap * (tileColumns - 1);
     const usableWidth = width - horizontalPadding - totalGap;
-    return Math.max(95, Math.floor(usableWidth / tileColumns));
-  }, [tileColumns, width]);
+    return Math.max(104, Math.floor(usableWidth / tileColumns));
+  }, [isSingleParticipantView, tileColumns, width]);
+  const tileHeight = useMemo(() => {
+    if (isSharingScreen) return Math.max(110, Math.floor(tileWidth * 0.62));
+    if (isSingleParticipantView) return Math.max(260, Math.floor(tileWidth * 1.06));
+    if (tileColumns === 2) return Math.max(170, Math.floor(tileWidth * 0.82));
+    if (tileColumns === 3) return Math.max(132, Math.floor(tileWidth * 0.8));
+    return Math.max(108, Math.floor(tileWidth * 0.76));
+  }, [isSharingScreen, isSingleParticipantView, tileColumns, tileWidth]);
+
+  useEffect(() => {
+    phaseRef.current = phase;
+  }, [phase]);
+
+  useEffect(() => {
+    roomIdRef.current = roomId;
+  }, [roomId]);
+
+  useEffect(() => {
+    localStreamRef.current = localStream;
+  }, [localStream]);
+
+  useEffect(() => {
+    screenShareStreamRef.current = screenShareStream;
+  }, [screenShareStream]);
+
+  useEffect(() => {
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      appStateRef.current = nextState;
+    });
+    return () => {
+      subscription.remove();
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
-      stopStream(localStream);
-      stopStream(screenShareStream);
-      socketManager.disconnect();
+      const activeRoomId = roomIdRef.current;
+      const activePhase = phaseRef.current;
+      if (activePhase === "inCall" && activeRoomId && !meetingEndedRef.current) {
+        void client
+          .post<LeaveMeetingResponse>(
+            `/meetings/${encodeURIComponent(activeRoomId)}/me/leave`
+          )
+          .catch(() => {
+            // Ignore teardown errors when screen unmounts.
+          });
+      }
+      stopStream(localStreamRef.current);
+      stopStream(screenShareStreamRef.current);
     };
-  }, [localStream, screenShareStream]);
+  }, []);
 
   useEffect(() => {
     if (sharedMeetingId?.trim()) {
@@ -149,12 +369,161 @@ export default function CallRoomScreen() {
   }, [sharedMeetingId, sharedTitle]);
 
   useEffect(() => {
+    let cancelled = false;
+    const loadProfile = async () => {
+      try {
+        const response = await client.get<ProfileResponse>("/profile/me");
+        const resolvedName = response.data?.data?.displayName?.trim();
+        if (!cancelled && resolvedName) {
+          setDisplayName(resolvedName);
+        }
+      } catch {
+        // Keep default display name if profile cannot be loaded.
+      }
+    };
+
+    void loadProfile();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadEntitlements = async () => {
+      try {
+        const response = await client.get<SubscriptionResponse>("/payments/subscription");
+        const canRecord = Boolean(response.data?.data?.entitlements?.recording);
+        if (!cancelled) {
+          setCanUseRecording(canRecord);
+        }
+      } catch {
+        if (!cancelled) {
+          setCanUseRecording(false);
+        }
+      }
+    };
+
+    void loadEntitlements();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isInviteFlow || !sharedMeetingId?.trim()) return;
+
+    let cancelled = false;
+    const resolveInvitePreview = async () => {
+      setIsResolvingInvite(true);
+      try {
+        const encodedCode = encodeURIComponent(sharedMeetingId.trim());
+        const response = await client.get<InvitePreviewResponse>(
+          `/meetings/invite/${encodedCode}`
+        );
+        const data = response.data?.data;
+        if (cancelled || !data) return;
+        if (data.title?.trim()) {
+          setCallTitle(data.title.trim());
+        }
+        setInviteRequiresPassword(Boolean(data.requiresPassword));
+      } catch (err) {
+        const apiError = err as AxiosError<ApiErrorResponse>;
+        if (!cancelled) {
+          Alert.alert(
+            "Invite Error",
+            apiError?.response?.data?.message || "Unable to resolve invite link."
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setIsResolvingInvite(false);
+        }
+      }
+    };
+
+    void resolveInvitePreview();
+    return () => {
+      cancelled = true;
+    };
+  }, [isInviteFlow, sharedMeetingId]);
+
+  useEffect(() => {
+    if (phase !== "lobby") return;
+    if (!(sharedMeetingId || isInviteFlow || isCreatedFlow)) return;
+    const roomCode = (joinRoomId || sharedMeetingId || "").trim().toLowerCase();
+    if (!roomCode) return;
+
+    let cancelled = false;
+    const syncSessionForPreJoin = async () => {
+      try {
+        const data = await getMySession(roomCode);
+        if (!cancelled && data) {
+          applySessionData(data, roomCode, { applyEffectiveMedia: false });
+        }
+      } catch (err) {
+        const apiError = err as AxiosError<ApiErrorResponse>;
+        const isSessionMissing = apiError?.response?.status === 404;
+        const isAlreadyJoinedConflict =
+          apiError?.response?.status === 409 &&
+          (apiError?.response?.data?.message || "")
+            .toLowerCase()
+            .includes("participant already joined");
+        if (!cancelled && !isSessionMissing && !isAlreadyJoinedConflict) {
+          console.error("[Meetings] Failed to prefetch my session", {
+            message: apiError?.message || String(err),
+            status: apiError?.response?.status,
+            responseData: apiError?.response?.data,
+            roomCode,
+          });
+        }
+      }
+    };
+
+    void syncSessionForPreJoin();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    applySessionData,
+    getMySession,
+    isCreatedFlow,
+    isInviteFlow,
+    joinRoomId,
+    phase,
+    sharedMeetingId,
+  ]);
+
+  useEffect(() => {
     if (phase !== "inCall") return;
     const id = setInterval(() => {
       setElapsedSeconds((prev) => prev + 1);
     }, 1000);
     return () => clearInterval(id);
   }, [phase]);
+
+  useEffect(() => {
+    if (phase !== "inCall" || !roomId.trim()) return;
+
+    const refreshState = async () => {
+      if (appStateRef.current !== "active") return;
+      if (isPollingStateRef.current) return;
+      isPollingStateRef.current = true;
+      try {
+        await fetchMeetingState(roomId);
+      } catch {
+      } finally {
+        isPollingStateRef.current = false;
+      }
+    };
+
+    void refreshState();
+    const id = setInterval(() => {
+      void refreshState();
+    }, ROOM_STATE_POLL_INTERVAL_MS);
+
+    return () => clearInterval(id);
+  }, [fetchMeetingState, phase, roomId]);
 
   useEffect(() => {
     if (phase !== "inCall" || !isRecording) return;
@@ -245,6 +614,13 @@ export default function CallRoomScreen() {
   };
 
   const toggleScreenShare = async () => {
+    if (!isShareRequested && !canScreenShare) {
+      Alert.alert(
+        "Screen Share Disabled",
+        "Screen sharing is not available for your current session."
+      );
+      return;
+    }
     if (isShareRequested) {
       stopScreenShare();
       setMediaInfo("Screen sharing stopped.");
@@ -386,6 +762,13 @@ export default function CallRoomScreen() {
   };
 
   const toggleRecording = async () => {
+    if (!isRecording && !canUseRecording) {
+      Alert.alert(
+        "Recording Not Available",
+        "Recording is not available on your current plan."
+      );
+      return;
+    }
     if (isRecording) {
       await stopRecording();
     } else {
@@ -394,122 +777,488 @@ export default function CallRoomScreen() {
     setIsMoreMenuOpen(false);
   };
 
-  const bootstrapParticipants = async (activeRoomId: string) => {
-    const local: CallParticipant = {
-      id: "local-me",
-      name: displayName.trim() || "You",
-      isLocal: true,
-      isHost: true,
-      isMicOn,
-      isCameraOn: isCamOn,
-    };
-    const remoteA: CallParticipant = {
-      id: `remote-${Date.now()}-1`,
-      ...remoteParticipantPool[0],
-    };
-    const remoteB: CallParticipant = {
-      id: `remote-${Date.now()}-2`,
-      ...remoteParticipantPool[1],
-    };
-    setRoomId(activeRoomId);
-    setParticipants([local, remoteA, remoteB]);
-    setSpeakerId(remoteA.id);
-    setChatMessages([
-      {
-        id: "chat-hello",
-        senderId: remoteA.id,
-        senderName: remoteA.name,
-        text: "Welcome everyone. Let's begin.",
-        sentAt: new Date().toISOString(),
-        mine: false,
-      },
-    ]);
-    setElapsedSeconds(0);
-    setPhase("inCall");
-    await startOrRefreshLocalMedia({ audio: isMicOn, video: isCamOn });
-
-    if (enableRealtime && authToken.trim() && hasRealtimeConfig) {
-      setRealtimeStatus("connecting");
-      setRealtimeInfo("Connecting to signaling...");
-      try {
-        const socket = socketManager.connect(authToken.trim());
-        await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => reject(new Error("Socket timeout")), 12000);
-          socket.on("connect", () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-          socket.on("connect_error", (err) => {
-            clearTimeout(timeout);
-            reject(err);
-          });
-        });
-
-        joinRoom(activeRoomId);
-        const capabilities = await getRouterCapabilities(activeRoomId);
-        if (capabilities.error) {
-          setRealtimeInfo(`Connected, mediasoup error: ${capabilities.error}`);
-        } else {
-          setRealtimeInfo("Connected to backend signaling + mediasoup router.");
-        }
-        setRealtimeStatus("connected");
-      } catch {
-        setRealtimeStatus("failed");
-        setRealtimeInfo("Realtime connect failed. Using simulation fallback.");
+  const applySessionData = useCallback(
+    (
+      session: MyMeetingSession | undefined,
+      fallbackRoomId: string,
+      options?: { applyEffectiveMedia?: boolean }
+    ) => {
+      if (!session) return;
+      const shouldApplyEffectiveMedia = options?.applyEffectiveMedia ?? true;
+      const effectiveMic = session.effective?.micOn ?? isMicOn;
+      const effectiveCam = session.effective?.cameraOn ?? isCamOn;
+      setLocalParticipantId(session.participantId || null);
+      setLocalRole(session.role === "host" ? "host" : "attendee");
+      if (shouldApplyEffectiveMedia) {
+        setIsMicOn(Boolean(effectiveMic));
+        setIsCamOn(Boolean(effectiveCam));
       }
-    } else {
-      setRealtimeStatus("idle");
-      setRealtimeInfo("Simulation mode active");
-    }
-  };
+      setRoomId(session.meetingId || fallbackRoomId);
 
-  const createMeetingNow = async () => {
-    await bootstrapParticipants(makeRoomId());
-  };
+      const canUnmute = session.capabilities?.canUnmuteSelf;
+      const canVideo = session.capabilities?.canStartVideo;
+      const canShare = session.capabilities?.canScreenShare;
+      const canRecord = session.capabilities?.canRecord;
+      if (typeof canUnmute === "boolean") setCanUnmuteSelf(canUnmute);
+      if (typeof canVideo === "boolean") setCanStartVideo(canVideo);
+      if (typeof canShare === "boolean") setCanScreenShare(canShare);
+      if (typeof canRecord === "boolean") setCanUseRecording(canRecord);
+    },
+    [isCamOn, isMicOn]
+  );
 
-  const joinMeeting = async () => {
-    if (!joinRoomId.trim()) return;
-    await bootstrapParticipants(joinRoomId.trim().toLowerCase());
-  };
+  const getMySession = useCallback(async (activeRoomId: string) => {
+    const response = await client.get<MySessionResponse>(
+      `/meetings/${encodeURIComponent(activeRoomId)}/me/session`
+    );
+    return response.data?.data;
+  }, []);
 
-  const leaveCall = () => {
+  const isMeetingEndedError = (error: AxiosError<ApiErrorResponse>) =>
+    error?.response?.status === 409 &&
+    (error?.response?.data?.message || "").toLowerCase().includes("meeting has ended");
+
+  const clearMeetingLocally = useCallback((reason?: string) => {
     setPhase("lobby");
     setParticipants([]);
     setChatMessages([]);
     setDraftMessage("");
     setJoinRoomId("");
+    setJoinPassword("");
     setRoomId("");
+    setLocalParticipantId(null);
+    setLocalRole("host");
     setElapsedSeconds(0);
     setChatOpen(false);
     setParticipantsOpen(false);
     setIsMoreMenuOpen(false);
-    stopStream(localStream);
+    setCanUnmuteSelf(true);
+    setCanStartVideo(true);
+    setCanScreenShare(true);
+    stopStream(localStreamRef.current);
     setLocalStream(null);
-    stopScreenShare();
-    if (isRecording) {
-      void stopRecording();
+    stopStream(screenShareStreamRef.current);
+    setScreenShareStream(null);
+    setIsShareRequested(false);
+    if (isRecordingRef.current) {
+      if (Platform.OS === "ios") {
+        void stopInAppRecording().catch(() => {});
+      } else {
+        void stopGlobalRecording({ settledTimeMs: 4500 }).catch(() => {});
+      }
     }
     setRecordingSeconds(0);
     setMediaInfo("Camera and mic not started yet.");
-    if (socketManager.isConnected()) {
-      leaveRoom(roomId);
-      socketManager.disconnect();
+    if (reason) {
+      Alert.alert("Meeting Ended", reason);
     }
-    setRealtimeStatus("idle");
-    setRealtimeInfo("Simulation mode active");
+  }, []);
+
+  const buildJoinPayload = useCallback(
+    (nextMicOn: boolean, nextCamOn: boolean): JoinMeetingRequest => ({
+      displayName: displayName.trim() || "You",
+      password: joinPassword.trim(),
+      preJoin: {
+        micOn: nextMicOn,
+        cameraOn: nextCamOn,
+      },
+      device: {
+        platform: Platform.OS,
+        appVersion: Constants.expoConfig?.version || "dev",
+      },
+    }),
+    [displayName, joinPassword]
+  );
+
+  const restoreMySession = useCallback(
+    async (activeRoomId: string, nextMicOn: boolean, nextCamOn: boolean) => {
+      try {
+        const existing = await getMySession(activeRoomId);
+        if (existing) {
+          applySessionData(existing, activeRoomId);
+          return true;
+        }
+      } catch (err) {
+        const sessionError = err as AxiosError<ApiErrorResponse>;
+        if (sessionError?.response?.status !== 404) {
+          throw err;
+        }
+      }
+
+      const payload = buildJoinPayload(nextMicOn, nextCamOn);
+      const joinResponse = await client.post<JoinMeetingResponse>(
+        `/meetings/${encodeURIComponent(activeRoomId)}/me/join`,
+        payload
+      );
+      const joined = joinResponse.data?.data;
+      if (!joined) return false;
+      applySessionData(joined, activeRoomId);
+      return true;
+    },
+    [applySessionData, buildJoinPayload, getMySession]
+  );
+
+  const fetchMeetingState = useCallback(async (activeRoomId: string) => {
+    let response;
+    try {
+      response = await client.get<MeetingStateResponse>(
+        `/meetings/${encodeURIComponent(activeRoomId)}/state`
+      );
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      if (isMeetingEndedError(apiError)) {
+        meetingEndedRef.current = true;
+        setMediaInfo("Meeting has ended on the server.");
+        return;
+      }
+      throw err;
+    }
+    const state = response.data?.data;
+    if (!state) return;
+
+    const knownLocalId = localParticipantId;
+    const fallbackName = (displayName.trim() || "You").toLowerCase();
+    const rawParticipants: CallParticipant[] = state.participants.map((person) => {
+      const isLocal =
+        (knownLocalId && person.id === knownLocalId) ||
+        person.displayName?.trim().toLowerCase() === fallbackName;
+      return {
+        id: person.id,
+        name: person.displayName || "Participant",
+        isHost: Boolean(person.isHost),
+        isLocal: Boolean(isLocal),
+        isMicOn: Boolean(person.isMicOn),
+        isCameraOn: Boolean(person.isCameraOn),
+      };
+    });
+    const dedupedById = Array.from(
+      new Map(rawParticipants.map((person) => [person.id, person])).values()
+    );
+    const localNameKey = fallbackName;
+    const localSelf = dedupedById.find((person) => person.isLocal);
+    const nextParticipants =
+      localSelf && localNameKey
+        ? [
+            ...dedupedById.filter((person) => person.id === localSelf.id),
+            ...dedupedById.filter(
+              (person) =>
+                person.id !== localSelf.id &&
+                person.name.trim().toLowerCase() !== localNameKey
+            ),
+          ]
+        : dedupedById;
+
+    if (state.title?.trim()) {
+      setCallTitle(state.title.trim());
+    }
+    if (nextParticipants.length > 0) {
+      setParticipants(nextParticipants);
+      const local = nextParticipants.find((person) => person.isLocal);
+      if (local) {
+        setIsMicOn(local.isMicOn);
+        setIsCamOn(local.isCameraOn);
+        setLocalRole(local.isHost ? "host" : "attendee");
+        if (!localParticipantId) {
+          setLocalParticipantId(local.id);
+        }
+      }
+    }
+  }, [displayName, localParticipantId]);
+
+  const fetchChatHistory = useCallback(async (activeRoomId: string) => {
+    const response = await client.get<MeetingChatHistoryResponse>(
+      `/meetings/${encodeURIComponent(activeRoomId)}/chat/messages`
+    );
+    const items = response.data?.data?.items || [];
+    if (items.length === 0) return;
+    setChatMessages(
+      items.map((msg) => ({
+        id: msg.id,
+        senderId: msg.senderId,
+        senderName: msg.senderName || "Participant",
+        text: msg.text,
+        sentAt: msg.sentAt || new Date().toISOString(),
+        mine: Boolean(localParticipantId && msg.senderId === localParticipantId),
+      }))
+    );
+  }, [localParticipantId]);
+
+  const updateParticipantMedia = async (
+    activeRoomId: string,
+    nextMicOn: boolean,
+    nextCamOn: boolean
+  ) => {
+    const applyMediaResponse = (payload?: ParticipantMediaUpdateResponse["data"]) => {
+      if (!payload) return;
+      const resolvedMic =
+        typeof payload.isMicOn === "boolean"
+          ? payload.isMicOn
+          : typeof payload.micOn === "boolean"
+          ? payload.micOn
+          : nextMicOn;
+      const resolvedCam =
+        typeof payload.isCameraOn === "boolean"
+          ? payload.isCameraOn
+          : typeof payload.cameraOn === "boolean"
+          ? payload.cameraOn
+          : nextCamOn;
+
+      setIsMicOn(resolvedMic);
+      setIsCamOn(resolvedCam);
+      setLocalParticipantState(resolvedMic, resolvedCam);
+      if (nextMicOn && !resolvedMic) {
+        setMediaInfo("Microphone remains muted by meeting policy/host controls.");
+      }
+      if (nextCamOn && !resolvedCam) {
+        setMediaInfo("Camera remains off by meeting policy/host controls.");
+      }
+    };
+
+    const sendMediaPatch = async () =>
+      client.patch<ParticipantMediaUpdateResponse>(
+        `/meetings/${encodeURIComponent(activeRoomId)}/me/media`,
+        {
+          isMicOn: nextMicOn,
+          isCameraOn: nextCamOn,
+        }
+      );
+
+    try {
+      const response = await sendMediaPatch();
+      applyMediaResponse(response.data?.data);
+      return;
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      if (isMeetingEndedError(apiError)) {
+        meetingEndedRef.current = true;
+        setMediaInfo("Could not sync microphone/camera. Retrying room state...");
+        return;
+      }
+      const isMissingSession =
+        apiError?.response?.status === 404 &&
+        (apiError?.response?.data?.message || "")
+          .toLowerCase()
+          .includes("participant session not found");
+      if (!isMissingSession) throw err;
+    }
+
+    const restored = await restoreMySession(activeRoomId, nextMicOn, nextCamOn);
+    if (!restored) {
+      throw new Error("Failed to restore meeting session.");
+    }
+
+    try {
+      const retry = await sendMediaPatch();
+      applyMediaResponse(retry.data?.data);
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      if (isMeetingEndedError(apiError)) {
+        meetingEndedRef.current = true;
+        setMediaInfo("Could not sync microphone/camera. Retrying room state...");
+        return;
+      }
+      throw err;
+    }
+  };
+
+  const leaveMeetingOnServer = async (activeRoomId: string) => {
+    await client.post<LeaveMeetingResponse>(
+      `/meetings/${encodeURIComponent(activeRoomId)}/me/leave`
+    );
+  };
+
+  const endMeetingOnServer = async (activeRoomId: string) => {
+    await client.post<LeaveMeetingResponse>(
+      `/meetings/${encodeURIComponent(activeRoomId)}/end`,
+      { reason: "host_ended" }
+    );
+  };
+
+  const bootstrapParticipants = async (
+    activeRoomId: string,
+    options?: {
+      micOn?: boolean;
+      cameraOn?: boolean;
+      isHost?: boolean;
+      participantId?: string;
+    }
+  ) => {
+    const micOn = options?.micOn ?? isMicOn;
+    const cameraOn = options?.cameraOn ?? isCamOn;
+    const isHost = options?.isHost ?? true;
+    const participantId = options?.participantId || null;
+    const localVisualId = participantId || `local-${Date.now()}`;
+    setIsMicOn(micOn);
+    setIsCamOn(cameraOn);
+    setLocalRole(isHost ? "host" : "attendee");
+    setLocalParticipantId(participantId);
+
+    const local: CallParticipant = {
+      id: localVisualId,
+      name: displayName.trim() || "You",
+      isLocal: true,
+      isHost,
+      isMicOn: micOn,
+      isCameraOn: cameraOn,
+    };
+    setRoomId(activeRoomId);
+    setParticipants([local]);
+    setSpeakerId(null);
+    setChatMessages([]);
+    setElapsedSeconds(0);
+    setPhase("inCall");
+    await startOrRefreshLocalMedia({ audio: micOn, video: cameraOn });
+    try {
+      await fetchMeetingState(activeRoomId);
+      await fetchChatHistory(activeRoomId);
+    } catch {
+      // Keep local participant when room-state endpoints are temporarily unavailable.
+    }
+  };
+
+  const joinMeeting = async () => {
+    if (!joinRoomId.trim()) return;
+    if (joinInFlightRef.current || phase === "inCall") return;
+    const roomCode = joinRoomId.trim().toLowerCase();
+    const payload = buildJoinPayload(isMicOn, isCamOn);
+
+    try {
+      joinInFlightRef.current = true;
+      setIsJoiningMeeting(true);
+      meetingEndedRef.current = false;
+      setCanUnmuteSelf(true);
+      setCanStartVideo(true);
+      setCanScreenShare(true);
+      const response = await client.post<JoinMeetingResponse>(
+        `/meetings/${encodeURIComponent(roomCode)}/me/join`,
+        payload
+      );
+      const data = response.data?.data;
+
+      const desiredMic = payload.preJoin.micOn;
+      const desiredCam = payload.preJoin.cameraOn;
+      const resolvedRoomId = data?.meetingId || roomCode;
+      const resolvedIsHost = data?.role === "host";
+      applySessionData(data, resolvedRoomId, { applyEffectiveMedia: false });
+
+      await bootstrapParticipants(resolvedRoomId, {
+        micOn: desiredMic,
+        cameraOn: desiredCam,
+        isHost: resolvedIsHost,
+        participantId: data?.participantId || undefined,
+      });
+
+      const serverMic = data?.effective?.micOn;
+      const serverCam = data?.effective?.cameraOn;
+      if (
+        typeof serverMic === "boolean" &&
+        typeof serverCam === "boolean" &&
+        (serverMic !== desiredMic || serverCam !== desiredCam)
+      ) {
+        void updateParticipantMedia(resolvedRoomId, desiredMic, desiredCam).catch(() => {
+          void fetchMeetingState(resolvedRoomId);
+        });
+      }
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      if (isMeetingEndedError(apiError)) {
+        clearMeetingLocally(apiError?.response?.data?.message || "This meeting has ended.");
+        return;
+      }
+      Alert.alert(
+        "Join Failed",
+        apiError?.response?.data?.message || "Unable to join this meeting."
+      );
+    } finally {
+      setIsJoiningMeeting(false);
+      joinInFlightRef.current = false;
+    }
+  };
+
+  const leaveCall = async () => {
+    const activeRoomId = roomId;
+    if (activeRoomId && !meetingEndedRef.current) {
+      try {
+        setIsLeavingMeeting(true);
+        await leaveMeetingOnServer(activeRoomId);
+      } catch {
+        // Continue local cleanup even if server leave call fails.
+      } finally {
+        setIsLeavingMeeting(false);
+      }
+    }
+    clearMeetingLocally();
+    meetingEndedRef.current = false;
+  };
+
+  const endMeeting = async () => {
+    if (!roomId.trim()) return;
+    try {
+      await endMeetingOnServer(roomId);
+    } catch {
+      Alert.alert("End Failed", "Could not end this meeting right now.");
+      return;
+    }
+    await leaveCall();
   };
 
   const toggleLocalMic = () => {
+    if (!isMicOn && !canUnmuteSelf) {
+      Alert.alert(
+        "Cannot Unmute",
+        "Unmute is currently disabled for your participant role."
+      );
+      return;
+    }
     const nextMic = !isMicOn;
+    if (nextMic && getMicrophonePermissionStatus() !== "granted") {
+      const promptMicSettings = () =>
+        Alert.alert(
+          "Microphone Permission Needed",
+          "Allow microphone permission in your device settings to unmute.",
+          [
+            { text: "Cancel", style: "cancel" },
+            {
+              text: "Open Settings",
+              onPress: () => {
+                void Linking.openSettings();
+              },
+            },
+          ]
+        );
+
+      void requestMicrophonePermission()
+        .then((permission) => {
+          if (permission.status !== "granted") {
+            promptMicSettings();
+          }
+        })
+        .catch(() => {
+          promptMicSettings();
+        });
+      return;
+    }
     setIsMicOn(nextMic);
     setLocalParticipantState(nextMic, isCamOn);
     setTrackEnabled("audio", nextMic);
     if (phase === "inCall" && nextMic && !hasTrack("audio")) {
       void startOrRefreshLocalMedia({ audio: nextMic, video: isCamOn });
     }
+    if (phase === "inCall" && roomId) {
+      void updateParticipantMedia(roomId, nextMic, isCamOn).catch(() => {
+        void fetchMeetingState(roomId);
+      });
+    }
   };
 
   const toggleLocalCam = () => {
+    if (!isCamOn && !canStartVideo) {
+      Alert.alert(
+        "Cannot Start Video",
+        "Camera is currently disabled for your participant role."
+      );
+      return;
+    }
     const nextCam = !isCamOn;
     setIsCamOn(nextCam);
     setLocalParticipantState(isMicOn, nextCam);
@@ -517,24 +1266,11 @@ export default function CallRoomScreen() {
     if (phase === "inCall" && nextCam && !hasTrack("video")) {
       void startOrRefreshLocalMedia({ audio: isMicOn, video: nextCam });
     }
-  };
-
-  const addParticipant = () => {
-    const next = activeRemotePool[0];
-    if (!next) return;
-    setParticipants((prev) => [
-      ...prev,
-      { id: `remote-${Date.now()}`, ...next },
-    ]);
-  };
-
-  const removeLastRemote = () => {
-    setParticipants((prev) => {
-      const remotes = prev.filter((p) => !p.isLocal);
-      if (remotes.length === 0) return prev;
-      const removeId = remotes[remotes.length - 1].id;
-      return prev.filter((p) => p.id !== removeId);
-    });
+    if (phase === "inCall" && roomId) {
+      void updateParticipantMedia(roomId, isMicOn, nextCam).catch(() => {
+        void fetchMeetingState(roomId);
+      });
+    }
   };
 
   const sendChat = () => {
@@ -555,46 +1291,35 @@ export default function CallRoomScreen() {
     setChatMessages((prev) => [...prev, mine]);
     setDraftMessage("");
 
-    if (socketManager.isConnected()) {
-      sendRoomMessage({ roomId, text });
+    if (roomId && localParticipantId) {
+      void client
+        .post<MeetingChatMessageResponse>(
+          `/meetings/${encodeURIComponent(roomId)}/chat/messages`,
+          {
+            participantId: localParticipantId,
+            text,
+          }
+        )
+        .then((response) => {
+          const saved = response.data?.data;
+          if (!saved) return;
+          setChatMessages((prev) =>
+            prev.map((item) =>
+              item.id === mine.id
+                ? {
+                    ...item,
+                    id: saved.id,
+                    sentAt: saved.sentAt || item.sentAt,
+                  }
+                : item
+            )
+          );
+        })
+        .catch(() => {
+          // Keep optimistic local message if backend chat save fails.
+        });
     }
-
-    const remoteParticipants = participants.filter((p) => !p.isLocal);
-    if (remoteParticipants.length === 0) return;
-    const randomRemote =
-      remoteParticipants[Math.floor(Math.random() * remoteParticipants.length)];
-    const randomReply =
-      callChatReplies[Math.floor(Math.random() * callChatReplies.length)];
-
-    setTimeout(() => {
-      const reply: CallChatMessage = {
-        id: `chat-${Date.now()}-r`,
-        senderId: randomRemote.id,
-        senderName: randomRemote.name,
-        text: randomReply,
-        sentAt: new Date().toISOString(),
-        mine: false,
-      };
-      setChatMessages((prev) => [...prev, reply]);
-    }, 900);
   };
-
-  useEffect(() => {
-    if (!socketManager.isConnected()) return;
-    const unsubscribe = onRoomMessage((payload) => {
-      if (payload.userId === "local-me") return;
-      const incoming: CallChatMessage = {
-        id: `chat-${Date.now()}-socket`,
-        senderId: payload.userId,
-        senderName: payload.displayName || "Participant",
-        text: payload.text,
-        sentAt: payload.sentAt || new Date().toISOString(),
-        mine: false,
-      };
-      setChatMessages((prev) => [...prev, incoming]);
-    });
-    return unsubscribe;
-  }, [phase]);
 
   if (phase === "lobby") {
     return (
@@ -605,118 +1330,178 @@ export default function CallRoomScreen() {
           <ScreenNav title="Call Room" fallbackHref="/(app)/(tabs)/home" />
 
           <View style={styles.heroCard}>
-            <Text style={styles.kicker}>Zoom-like Room</Text>
-            <Text style={styles.heroTitle}>Join or create a live call</Text>
+            <Text style={styles.kicker}>Meeting Room</Text>
+            <Text style={styles.heroTitle}>Ready to join your meeting</Text>
             <Text style={styles.heroSub}>
-              Simulation mode with adaptive tile layout, call controls, and meeting chat.
+              Configure your mic and camera before you enter.
             </Text>
             {sharedMeetingId ? (
               <Text style={styles.deepLinkHint}>
-                Invite link detected for meeting: {sharedMeetingId}
+                Meeting code: {sharedMeetingId}
+              </Text>
+            ) : null}
+            {isInviteFlow ? (
+              <Text style={styles.integrationStatus}>
+                {isResolvingInvite
+                  ? "Validating invite link..."
+                  : inviteRequiresPassword
+                  ? "This invite requires a meeting password."
+                  : "Invite ready. Configure mic/camera and join."}
               </Text>
             ) : null}
           </View>
 
           <View style={styles.panel}>
-            <Text style={styles.sectionTitle}>Your Name</Text>
+            <Text style={styles.sectionTitle}>Display Name</Text>
             <TextInput
               value={displayName}
-              onChangeText={setDisplayName}
+              editable={false}
               style={styles.input}
-              placeholder="How participants see you"
+              placeholder="Your profile display name"
               placeholderTextColor={colors.textMuted}
             />
 
             <View style={styles.preToggleRow}>
               <Pressable
                 onPress={toggleLocalMic}
-                style={[styles.preToggle, !isMicOn && styles.preToggleMuted]}
+                disabled={isMicPreJoinLocked}
+                style={[
+                  styles.preToggle,
+                  !isMicOn && styles.preToggleMuted,
+                  isMicPreJoinLocked && styles.disabledBtn,
+                ]}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  isMicPreJoinLocked
+                    ? "Microphone unmute unavailable before join"
+                    : isMicOn
+                    ? "Mute microphone before join"
+                    : "Unmute microphone before join"
+                }
+                accessibilityState={{ disabled: isMicPreJoinLocked }}
               >
                 <Ionicons
                   name={isMicOn ? "mic" : "mic-off"}
                   size={16}
-                  color={isMicOn ? colors.primaryDark : "#DC0000"}
+                  color={
+                    isMicPreJoinLocked
+                      ? colors.textMuted
+                      : isMicOn
+                      ? colors.primaryDark
+                      : "#DC0000"
+                  }
                 />
                 <Text style={styles.preToggleText}>{isMicOn ? "Mic On" : "Mic Off"}</Text>
               </Pressable>
               <Pressable
                 onPress={toggleLocalCam}
-                style={[styles.preToggle, !isCamOn && styles.preToggleMuted]}
+                disabled={isCamPreJoinLocked}
+                style={[
+                  styles.preToggle,
+                  !isCamOn && styles.preToggleMuted,
+                  isCamPreJoinLocked && styles.disabledBtn,
+                ]}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  isCamPreJoinLocked
+                    ? "Camera start unavailable before join"
+                    : isCamOn
+                    ? "Turn camera off before join"
+                    : "Turn camera on before join"
+                }
+                accessibilityState={{ disabled: isCamPreJoinLocked }}
               >
                 <Ionicons
                   name={isCamOn ? "videocam" : "videocam-off"}
                   size={16}
-                  color={isCamOn ? colors.primaryDark : "#DC0000"}
+                  color={
+                    isCamPreJoinLocked
+                      ? colors.textMuted
+                      : isCamOn
+                      ? colors.primaryDark
+                      : "#DC0000"
+                  }
                 />
                 <Text style={styles.preToggleText}>
                   {isCamOn ? "Camera On" : "Camera Off"}
                 </Text>
               </Pressable>
             </View>
+            {isMicPreJoinLocked ? (
+              <Text style={styles.integrationStatus}>
+                Microphone is locked for this session until host allows unmute.
+              </Text>
+            ) : null}
+            {isCamPreJoinLocked ? (
+              <Text style={styles.integrationStatus}>
+                Camera is locked for this session until video is allowed.
+              </Text>
+            ) : null}
           </View>
 
           <View style={styles.panel}>
-            <Text style={styles.sectionTitle}>Realtime Integration (Optional)</Text>
-            <Text style={styles.integrationHelp}>
-              Backend: {runtimeConfig.socketUrl}
-            </Text>
-            <TextInput
-              value={authToken}
-              onChangeText={setAuthToken}
-              style={styles.input}
-              placeholder="JWT token (for real socket + mediasoup)"
-              placeholderTextColor={colors.textMuted}
-              autoCapitalize="none"
-            />
-            <Pressable
-              onPress={() => setEnableRealtime((prev) => !prev)}
-              style={[
-                styles.preToggle,
-                !enableRealtime && styles.preToggleMuted,
-              ]}
-            >
-              <Text style={styles.preToggleText}>
-                {enableRealtime ? "Realtime: Enabled" : "Realtime: Disabled"}
-              </Text>
-            </Pressable>
-            <Text style={styles.integrationStatus}>
-              Status: {realtimeStatus.toUpperCase()} - {realtimeInfo}
-            </Text>
+            <Text style={styles.sectionTitle}>Media Status</Text>
             <Text style={styles.integrationStatus}>Media: {mediaInfo}</Text>
           </View>
 
-          <View style={styles.panel}>
-            <Text style={styles.sectionTitle}>Start New Meeting</Text>
-            <TextInput
-              value={callTitle}
-              onChangeText={setCallTitle}
-              style={styles.input}
-              placeholder="Meeting title"
-              placeholderTextColor={colors.textMuted}
-            />
-            <Pressable style={styles.primaryBtn} onPress={createMeetingNow}>
-              <Text style={styles.primaryBtnText}>Create & Start Call</Text>
-            </Pressable>
-          </View>
+          {!isCreatedFlow ? (
+            <View style={styles.panel}>
+              <Text style={styles.sectionTitle}>Join Existing Meeting</Text>
+              <TextInput
+                value={joinRoomId}
+                onChangeText={setJoinRoomId}
+                style={styles.input}
+                placeholder="abc-def-ghi"
+                placeholderTextColor={colors.textMuted}
+                autoCapitalize="none"
+              />
+              <TextInput
+                value={joinPassword}
+                onChangeText={setJoinPassword}
+                style={styles.input}
+                placeholder={
+                  inviteRequiresPassword
+                    ? "Meeting password (required)"
+                    : "Meeting password (optional)"
+                }
+                placeholderTextColor={colors.textMuted}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              <Pressable
+                style={[
+                  styles.primaryBtn,
+                  (!joinRoomId.trim() || isJoiningMeeting || isResolvingInvite) &&
+                    styles.disabledBtn,
+                ]}
+                disabled={!joinRoomId.trim() || isJoiningMeeting || isResolvingInvite}
+                onPress={joinMeeting}
+              >
+                <Text style={styles.primaryBtnText}>
+                  {isJoiningMeeting ? "Joining..." : "Join Meeting"}
+                </Text>
+              </Pressable>
+            </View>
+          ) : null}
 
-          <View style={styles.panel}>
-            <Text style={styles.sectionTitle}>Join Existing Meeting</Text>
-            <TextInput
-              value={joinRoomId}
-              onChangeText={setJoinRoomId}
-              style={styles.input}
-              placeholder="abc-def-ghi"
-              placeholderTextColor={colors.textMuted}
-              autoCapitalize="none"
-            />
-            <Pressable
-              style={[styles.primaryBtn, !joinRoomId.trim() && styles.disabledBtn]}
-              disabled={!joinRoomId.trim()}
-              onPress={joinMeeting}
-            >
-              <Text style={styles.primaryBtnText}>Join Meeting</Text>
-            </Pressable>
-          </View>
+          {isCreatedFlow && joinRoomId.trim() ? (
+            <View style={styles.panel}>
+              <Text style={styles.sectionTitle}>Meeting Ready</Text>
+              <Text style={styles.integrationStatus}>Code: {joinRoomId}</Text>
+              <Pressable
+                style={[
+                  styles.primaryBtn,
+                  (isJoiningMeeting || isResolvingInvite) && styles.disabledBtn,
+                ]}
+                disabled={isJoiningMeeting || isResolvingInvite}
+                onPress={joinMeeting}
+              >
+                <Text style={styles.primaryBtnText}>
+                  {isJoiningMeeting ? "Opening..." : "Start Meeting"}
+                </Text>
+              </Pressable>
+            </View>
+          ) : null}
         </ScrollView>
       </SafeAreaView>
     );
@@ -728,12 +1513,7 @@ export default function CallRoomScreen() {
         <View>
           <Text style={styles.roomTitle}>{callTitle}</Text>
           <Text style={styles.roomMeta}>
-            Room: {roomId} • {formattedElapsed}
-          </Text>
-          <Text style={styles.roomMeta}>
-            {realtimeStatus === "connected"
-              ? "Realtime connected"
-              : "Simulation mode"}
+            Room: {roomId} | {formattedElapsed}
           </Text>
           {isRecording ? (
             <View
@@ -758,14 +1538,14 @@ export default function CallRoomScreen() {
             style={styles.headerActionBtn}
             onPress={() => setParticipantsOpen((prev) => !prev)}
           >
-            <Ionicons name="people" size={18} color={colors.text} />
+            <Ionicons name="people" size={18} color="#FFFFFF" />
             <Text style={styles.headerActionText}>{participants.length}</Text>
           </Pressable>
           <Pressable
             style={styles.headerActionBtn}
             onPress={() => setChatOpen((prev) => !prev)}
           >
-            <Ionicons name="chatbubble-ellipses" size={18} color={colors.text} />
+            <Ionicons name="chatbubble-ellipses" size={18} color="#FFFFFF" />
           </Pressable>
         </View>
       </View>
@@ -775,7 +1555,11 @@ export default function CallRoomScreen() {
         key={`${tileColumns}`}
         numColumns={tileColumns}
         keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.tilesWrap}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={[
+          styles.tilesWrap,
+          isSingleParticipantView && styles.tilesWrapSingle,
+        ]}
         columnWrapperStyle={tileColumns > 1 ? { gap: tileGap } : undefined}
         ListHeaderComponent={
           isSharingScreen && screenShareStream ? (
@@ -798,9 +1582,9 @@ export default function CallRoomScreen() {
             <View
               style={[
                 styles.tile,
-                isSharingScreen && styles.tileCompact,
                 {
                   width: tileWidth,
+                  height: tileHeight,
                   borderColor: isSpeaking ? "#E8A339" : "#1A2D42",
                 },
               ]}
@@ -859,7 +1643,14 @@ export default function CallRoomScreen() {
           danger={!isMicOn}
           onPress={toggleLocalMic}
           active={isMicOn}
-          accessibilityLabel={isMicOn ? "Mute microphone" : "Unmute microphone"}
+          disabled={!isMicOn && !canUnmuteSelf}
+          accessibilityLabel={
+            !isMicOn && !canUnmuteSelf
+              ? "Unmute unavailable"
+              : isMicOn
+              ? "Mute microphone"
+              : "Unmute microphone"
+          }
         />
         <ControlButton
           icon={isCamOn ? "videocam" : "videocam-off"}
@@ -867,14 +1658,28 @@ export default function CallRoomScreen() {
           danger={!isCamOn}
           onPress={toggleLocalCam}
           active={isCamOn}
-          accessibilityLabel={isCamOn ? "Turn camera off" : "Turn camera on"}
+          disabled={!isCamOn && !canStartVideo}
+          accessibilityLabel={
+            !isCamOn && !canStartVideo
+              ? "Camera start unavailable"
+              : isCamOn
+              ? "Turn camera off"
+              : "Turn camera on"
+          }
         />
         <ControlButton
           icon="share-social"
           label="Share"
           onPress={() => void toggleScreenShare()}
           active={isShareRequested}
-          accessibilityLabel={isShareRequested ? "Stop screen sharing" : "Start screen sharing"}
+          disabled={!isShareRequested && !canScreenShare}
+          accessibilityLabel={
+            !isShareRequested && !canScreenShare
+              ? "Screen share unavailable"
+              : isShareRequested
+              ? "Stop screen sharing"
+              : "Start screen sharing"
+          }
         />
         <ControlButton
           icon="ellipsis-horizontal"
@@ -885,10 +1690,11 @@ export default function CallRoomScreen() {
         />
         <ControlButton
           icon="call"
-          label="Leave"
+          label={localRole === "host" ? "End" : "Leave"}
           danger
-          onPress={leaveCall}
-          accessibilityLabel="Leave call"
+          onPress={() => void (localRole === "host" ? endMeeting() : leaveCall())}
+          disabled={isLeavingMeeting}
+          accessibilityLabel={localRole === "host" ? "End call for all" : "Leave call"}
         />
       </View>
 
@@ -931,18 +1737,46 @@ export default function CallRoomScreen() {
               <Text style={styles.moreMenuText}>Participants</Text>
             </Pressable>
             <Pressable
-              style={[styles.moreMenuItem, isRecording && styles.moreMenuItemDanger]}
+              style={[
+                styles.moreMenuItem,
+                isRecording && styles.moreMenuItemDanger,
+                !canUseRecording && !isRecording && styles.disabledBtn,
+              ]}
               onPress={() => void toggleRecording()}
+              disabled={!canUseRecording && !isRecording}
               accessibilityRole="button"
-              accessibilityLabel={isRecording ? "Stop recording" : "Start recording"}
+              accessibilityLabel={
+                !canUseRecording && !isRecording
+                  ? "Recording not available on your plan"
+                  : isRecording
+                  ? "Stop recording"
+                  : "Start recording"
+              }
+              accessibilityState={{ disabled: !canUseRecording && !isRecording }}
             >
               <Ionicons
                 name={isRecording ? "stop-circle" : "radio-button-on"}
                 size={16}
-                color={isRecording ? "#fff" : "#DC0000"}
+                color={
+                  !canUseRecording && !isRecording
+                    ? colors.textMuted
+                    : isRecording
+                    ? "#fff"
+                    : "#DC0000"
+                }
               />
-              <Text style={[styles.moreMenuText, isRecording && styles.moreMenuTextDanger]}>
-                {isRecording ? "Stop Recording" : "Record Meeting"}
+              <Text
+                style={[
+                  styles.moreMenuText,
+                  isRecording && styles.moreMenuTextDanger,
+                  !canUseRecording && !isRecording && { color: colors.textMuted },
+                ]}
+              >
+                {!canUseRecording && !isRecording
+                  ? "Recording Locked (Current Plan)"
+                  : isRecording
+                  ? "Stop Recording"
+                  : "Record Meeting"}
               </Text>
             </Pressable>
             {lastRecordingPath ? (
@@ -985,15 +1819,6 @@ export default function CallRoomScreen() {
                 </View>
               ))}
             </ScrollView>
-
-            <View style={styles.simActions}>
-              <Pressable onPress={addParticipant} style={styles.simBtn}>
-                <Text style={styles.simBtnText}>Simulate Join</Text>
-              </Pressable>
-              <Pressable onPress={removeLastRemote} style={styles.simBtn}>
-                <Text style={styles.simBtnText}>Simulate Leave</Text>
-              </Pressable>
-            </View>
           </View>
         </View>
       ) : null}
@@ -1056,6 +1881,7 @@ function ControlButton({
   onPress,
   danger,
   active,
+  disabled,
   accessibilityLabel,
 }: {
   icon: keyof typeof Ionicons.glyphMap;
@@ -1063,15 +1889,22 @@ function ControlButton({
   onPress: () => void;
   danger?: boolean;
   active?: boolean;
+  disabled?: boolean;
   accessibilityLabel?: string;
 }) {
   return (
     <Pressable
       onPress={onPress}
-      style={[styles.controlBtn, active && styles.controlBtnActive, danger && styles.controlBtnDanger]}
+      disabled={disabled}
+      style={[
+        styles.controlBtn,
+        active && styles.controlBtnActive,
+        danger && styles.controlBtnDanger,
+        disabled && styles.disabledBtn,
+      ]}
       accessibilityRole="button"
       accessibilityLabel={accessibilityLabel || label}
-      accessibilityState={{ selected: !!active }}
+      accessibilityState={{ selected: !!active, disabled: !!disabled }}
     >
       <Ionicons name={icon} size={18} color="#fff" />
       <Text style={styles.controlText}>{label}</Text>
@@ -1157,12 +1990,6 @@ const styles = StyleSheet.create({
     fontFamily: type.body,
     fontSize: 15,
     fontWeight: "800",
-  },
-  integrationHelp: {
-    color: colors.textMuted,
-    fontFamily: type.body,
-    fontSize: 12,
-    marginTop: -4,
   },
   integrationStatus: {
     color: colors.textMuted,
@@ -1306,7 +2133,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
   },
   headerActionText: {
-    color: "#E3EEFB",
+    color: "#FFFFFF",
     fontFamily: type.body,
     fontSize: 12,
     fontWeight: "700",
@@ -1315,6 +2142,9 @@ const styles = StyleSheet.create({
     padding: 10,
     gap: 8,
     paddingBottom: 120,
+  },
+  tilesWrapSingle: {
+    alignItems: "center",
   },
   shareStageWrap: {
     marginBottom: 10,
@@ -1554,26 +2384,6 @@ const styles = StyleSheet.create({
   participantStatus: {
     flexDirection: "row",
     gap: 8,
-  },
-  simActions: {
-    flexDirection: "row",
-    gap: 8,
-    marginTop: 6,
-  },
-  simBtn: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: colors.stroke,
-    backgroundColor: colors.surfaceSoft,
-    borderRadius: 10,
-    paddingVertical: 10,
-    alignItems: "center",
-  },
-  simBtnText: {
-    color: colors.text,
-    fontFamily: type.body,
-    fontSize: 12,
-    fontWeight: "700",
   },
   chatOverlay: {
     ...StyleSheet.absoluteFillObject,
