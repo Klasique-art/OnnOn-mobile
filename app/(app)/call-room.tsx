@@ -1,6 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useCallback, useMemo, useState, useEffect, useRef } from "react";
-import { useLocalSearchParams } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { AxiosError } from "axios";
 import Constants from "expo-constants";
 import * as FileSystem from "expo-file-system/legacy";
@@ -262,7 +262,10 @@ export default function CallRoomScreen() {
   const isRecordingRef = useRef(false);
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
   const meetingEndedRef = useRef(false);
+  const [meetingEndedReason, setMeetingEndedReason] = useState<string | null>(null);
   const joinInFlightRef = useRef(false);
+  // Tracks whether a mic/cam PATCH is in-flight so polling doesn't overwrite optimistic state.
+  const pendingMediaUpdateRef = useRef(false);
 
   const sharedMeetingId = useMemo(
     () => (Array.isArray(meetingId) ? meetingId[0] : meetingId),
@@ -304,6 +307,7 @@ export default function CallRoomScreen() {
     const usableWidth = width - horizontalPadding - totalGap;
     return Math.max(104, Math.floor(usableWidth / tileColumns));
   }, [isSingleParticipantView, tileColumns, width]);
+  const isSharingScreen = isShareRequested && !!screenShareStream;
   const tileHeight = useMemo(() => {
     if (isSharingScreen) return Math.max(110, Math.floor(tileWidth * 0.62));
     if (isSingleParticipantView) return Math.max(260, Math.floor(tileWidth * 1.06));
@@ -448,6 +452,43 @@ export default function CallRoomScreen() {
     };
   }, [isInviteFlow, sharedMeetingId]);
 
+  const applySessionData = useCallback(
+    (
+      session: MyMeetingSession | undefined,
+      fallbackRoomId: string,
+      options?: { applyEffectiveMedia?: boolean }
+    ) => {
+      if (!session) return;
+      const shouldApplyEffectiveMedia = options?.applyEffectiveMedia ?? true;
+      const effectiveMic = session.effective?.micOn ?? isMicOn;
+      const effectiveCam = session.effective?.cameraOn ?? isCamOn;
+      setLocalParticipantId(session.participantId || null);
+      setLocalRole(session.role === "host" ? "host" : "attendee");
+      if (shouldApplyEffectiveMedia) {
+        setIsMicOn(Boolean(effectiveMic));
+        setIsCamOn(Boolean(effectiveCam));
+      }
+      setRoomId(session.meetingId || fallbackRoomId);
+
+      const canUnmute = session.capabilities?.canUnmuteSelf;
+      const canVideo = session.capabilities?.canStartVideo;
+      const canShare = session.capabilities?.canScreenShare;
+      const canRecord = session.capabilities?.canRecord;
+      if (typeof canUnmute === "boolean") setCanUnmuteSelf(canUnmute);
+      if (typeof canVideo === "boolean") setCanStartVideo(canVideo);
+      if (typeof canShare === "boolean") setCanScreenShare(canShare);
+      if (typeof canRecord === "boolean") setCanUseRecording(canRecord);
+    },
+    [isCamOn, isMicOn]
+  );
+
+  const getMySession = useCallback(async (activeRoomId: string) => {
+    const response = await client.get<MySessionResponse>(
+      `/meetings/${encodeURIComponent(activeRoomId)}/me/session`
+    );
+    return response.data?.data;
+  }, []);
+
   useEffect(() => {
     if (phase !== "lobby") return;
     if (!(sharedMeetingId || isInviteFlow || isCreatedFlow)) return;
@@ -469,7 +510,12 @@ export default function CallRoomScreen() {
           (apiError?.response?.data?.message || "")
             .toLowerCase()
             .includes("participant already joined");
-        if (!cancelled && !isSessionMissing && !isAlreadyJoinedConflict) {
+        const isMeetingEnded =
+          apiError?.response?.status === 409 &&
+          (apiError?.response?.data?.message || "")
+            .toLowerCase()
+            .includes("meeting has ended");
+        if (!cancelled && !isSessionMissing && !isAlreadyJoinedConflict && !isMeetingEnded) {
           console.error("[Meetings] Failed to prefetch my session", {
             message: apiError?.message || String(err),
             status: apiError?.response?.status,
@@ -501,6 +547,82 @@ export default function CallRoomScreen() {
     }, 1000);
     return () => clearInterval(id);
   }, [phase]);
+
+  const fetchMeetingState = useCallback(async (activeRoomId: string) => {
+    let response;
+    try {
+      response = await client.get<MeetingStateResponse>(
+        `/meetings/${encodeURIComponent(activeRoomId)}/state`
+      );
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      if (isMeetingEndedError(apiError)) {
+        meetingEndedRef.current = true;
+        setMeetingEndedReason("This meeting has been ended by the host.");
+        return;
+      }
+      throw err;
+    }
+    const state = response.data?.data;
+    if (!state) return;
+
+    const knownLocalId = localParticipantId;
+    const fallbackName = (displayName.trim() || "You").toLowerCase();
+    const rawParticipants: CallParticipant[] = state.participants.map((person) => {
+      const isLocal =
+        (knownLocalId && person.id === knownLocalId) ||
+        person.displayName?.trim().toLowerCase() === fallbackName;
+      return {
+        id: person.id,
+        name: person.displayName || "Participant",
+        isHost: Boolean(person.isHost),
+        isLocal: Boolean(isLocal),
+        isMicOn: Boolean(person.isMicOn),
+        isCameraOn: Boolean(person.isCameraOn),
+      };
+    });
+    const dedupedById = Array.from(
+      new Map(rawParticipants.map((person) => [person.id, person])).values()
+    );
+    const localNameKey = fallbackName;
+    const localSelf = dedupedById.find((person) => person.isLocal);
+    const nextParticipants =
+      localSelf && localNameKey
+        ? [
+          ...dedupedById.filter((person) => person.id === localSelf.id),
+          ...dedupedById.filter(
+            (person) =>
+              person.id !== localSelf.id &&
+              person.name.trim().toLowerCase() !== localNameKey
+          ),
+        ]
+        : dedupedById;
+
+    if (state.title?.trim()) {
+      setCallTitle(state.title.trim());
+    }
+    if (nextParticipants.length > 0) {
+      setParticipants(nextParticipants);
+      const local = nextParticipants.find((person) => person.isLocal);
+      if (local) {
+        // Only sync mic/cam from polling when no PATCH update is currently in-flight.
+        // Without this guard, the poll response overwrites the optimistic toggle
+        // before the PATCH has a chance to confirm the new state.
+        console.log("[Polling] fetchMeetingState — local participant mic:", local.isMicOn, "cam:", local.isCameraOn, "| pendingMediaUpdateRef:", pendingMediaUpdateRef.current);
+        if (!pendingMediaUpdateRef.current) {
+          console.log("[Polling] Applying polled mic/cam state to UI");
+          setIsMicOn(local.isMicOn);
+          setIsCamOn(local.isCameraOn);
+        } else {
+          console.log("[Polling] Skipping poll overwrite — PATCH in-flight");
+        }
+        setLocalRole(local.isHost ? "host" : "attendee");
+        if (!localParticipantId) {
+          setLocalParticipantId(local.id);
+        }
+      }
+    }
+  }, [displayName, localParticipantId]);
 
   useEffect(() => {
     if (phase !== "inCall" || !roomId.trim()) return;
@@ -557,7 +679,7 @@ export default function CallRoomScreen() {
     const s = String(recordingSeconds % 60).padStart(2, "0");
     return `${m}:${s}`;
   }, [recordingSeconds]);
-  const isSharingScreen = isShareRequested && !!screenShareStream;
+
 
   const setLocalParticipantState = (nextMicOn: boolean, nextCamOn: boolean) => {
     setParticipants((prev) =>
@@ -631,7 +753,7 @@ export default function CallRoomScreen() {
       const stream = await getScreenShareStream();
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
-        videoTrack.onended = () => {
+        (videoTrack as any).onended = () => {
           stopScreenShare();
           setMediaInfo("Screen sharing ended.");
         };
@@ -648,7 +770,7 @@ export default function CallRoomScreen() {
     const normalizedPath = path.startsWith("file://") ? path : `file://${path}`;
     let isStable = false;
     for (let i = 0; i < 6; i += 1) {
-      const info = await FileSystem.getInfoAsync(normalizedPath, { size: true });
+      const info = await FileSystem.getInfoAsync(normalizedPath);
       if (info.exists && typeof info.size === "number" && info.size > 16_000) {
         isStable = true;
         break;
@@ -777,42 +899,7 @@ export default function CallRoomScreen() {
     setIsMoreMenuOpen(false);
   };
 
-  const applySessionData = useCallback(
-    (
-      session: MyMeetingSession | undefined,
-      fallbackRoomId: string,
-      options?: { applyEffectiveMedia?: boolean }
-    ) => {
-      if (!session) return;
-      const shouldApplyEffectiveMedia = options?.applyEffectiveMedia ?? true;
-      const effectiveMic = session.effective?.micOn ?? isMicOn;
-      const effectiveCam = session.effective?.cameraOn ?? isCamOn;
-      setLocalParticipantId(session.participantId || null);
-      setLocalRole(session.role === "host" ? "host" : "attendee");
-      if (shouldApplyEffectiveMedia) {
-        setIsMicOn(Boolean(effectiveMic));
-        setIsCamOn(Boolean(effectiveCam));
-      }
-      setRoomId(session.meetingId || fallbackRoomId);
 
-      const canUnmute = session.capabilities?.canUnmuteSelf;
-      const canVideo = session.capabilities?.canStartVideo;
-      const canShare = session.capabilities?.canScreenShare;
-      const canRecord = session.capabilities?.canRecord;
-      if (typeof canUnmute === "boolean") setCanUnmuteSelf(canUnmute);
-      if (typeof canVideo === "boolean") setCanStartVideo(canVideo);
-      if (typeof canShare === "boolean") setCanScreenShare(canShare);
-      if (typeof canRecord === "boolean") setCanUseRecording(canRecord);
-    },
-    [isCamOn, isMicOn]
-  );
-
-  const getMySession = useCallback(async (activeRoomId: string) => {
-    const response = await client.get<MySessionResponse>(
-      `/meetings/${encodeURIComponent(activeRoomId)}/me/session`
-    );
-    return response.data?.data;
-  }, []);
 
   const isMeetingEndedError = (error: AxiosError<ApiErrorResponse>) =>
     error?.response?.status === 409 &&
@@ -842,9 +929,9 @@ export default function CallRoomScreen() {
     setIsShareRequested(false);
     if (isRecordingRef.current) {
       if (Platform.OS === "ios") {
-        void stopInAppRecording().catch(() => {});
+        void stopInAppRecording().catch(() => { });
       } else {
-        void stopGlobalRecording({ settledTimeMs: 4500 }).catch(() => {});
+        void stopGlobalRecording({ settledTimeMs: 4500 }).catch(() => { });
       }
     }
     setRecordingSeconds(0);
@@ -853,6 +940,13 @@ export default function CallRoomScreen() {
       Alert.alert("Meeting Ended", reason);
     }
   }, []);
+
+  // When any API call returns a 409 "Meeting has ended", exit the call and alert the user.
+  useEffect(() => {
+    if (!meetingEndedReason) return;
+    setMeetingEndedReason(null);
+    clearMeetingLocally(meetingEndedReason);
+  }, [meetingEndedReason, clearMeetingLocally]);
 
   const buildJoinPayload = useCallback(
     (nextMicOn: boolean, nextCamOn: boolean): JoinMeetingRequest => ({
@@ -898,72 +992,7 @@ export default function CallRoomScreen() {
     [applySessionData, buildJoinPayload, getMySession]
   );
 
-  const fetchMeetingState = useCallback(async (activeRoomId: string) => {
-    let response;
-    try {
-      response = await client.get<MeetingStateResponse>(
-        `/meetings/${encodeURIComponent(activeRoomId)}/state`
-      );
-    } catch (err) {
-      const apiError = err as AxiosError<ApiErrorResponse>;
-      if (isMeetingEndedError(apiError)) {
-        meetingEndedRef.current = true;
-        setMediaInfo("Meeting has ended on the server.");
-        return;
-      }
-      throw err;
-    }
-    const state = response.data?.data;
-    if (!state) return;
 
-    const knownLocalId = localParticipantId;
-    const fallbackName = (displayName.trim() || "You").toLowerCase();
-    const rawParticipants: CallParticipant[] = state.participants.map((person) => {
-      const isLocal =
-        (knownLocalId && person.id === knownLocalId) ||
-        person.displayName?.trim().toLowerCase() === fallbackName;
-      return {
-        id: person.id,
-        name: person.displayName || "Participant",
-        isHost: Boolean(person.isHost),
-        isLocal: Boolean(isLocal),
-        isMicOn: Boolean(person.isMicOn),
-        isCameraOn: Boolean(person.isCameraOn),
-      };
-    });
-    const dedupedById = Array.from(
-      new Map(rawParticipants.map((person) => [person.id, person])).values()
-    );
-    const localNameKey = fallbackName;
-    const localSelf = dedupedById.find((person) => person.isLocal);
-    const nextParticipants =
-      localSelf && localNameKey
-        ? [
-            ...dedupedById.filter((person) => person.id === localSelf.id),
-            ...dedupedById.filter(
-              (person) =>
-                person.id !== localSelf.id &&
-                person.name.trim().toLowerCase() !== localNameKey
-            ),
-          ]
-        : dedupedById;
-
-    if (state.title?.trim()) {
-      setCallTitle(state.title.trim());
-    }
-    if (nextParticipants.length > 0) {
-      setParticipants(nextParticipants);
-      const local = nextParticipants.find((person) => person.isLocal);
-      if (local) {
-        setIsMicOn(local.isMicOn);
-        setIsCamOn(local.isCameraOn);
-        setLocalRole(local.isHost ? "host" : "attendee");
-        if (!localParticipantId) {
-          setLocalParticipantId(local.id);
-        }
-      }
-    }
-  }, [displayName, localParticipantId]);
 
   const fetchChatHistory = useCallback(async (activeRoomId: string) => {
     const response = await client.get<MeetingChatHistoryResponse>(
@@ -988,21 +1017,29 @@ export default function CallRoomScreen() {
     nextMicOn: boolean,
     nextCamOn: boolean
   ) => {
+    // Resolve the confirmed mic/cam values from the PATCH response.
+    // If the backend returns no `data` field, trust the intended (nextMicOn/nextCamOn) values.
     const applyMediaResponse = (payload?: ParticipantMediaUpdateResponse["data"]) => {
-      if (!payload) return;
-      const resolvedMic =
-        typeof payload.isMicOn === "boolean"
+      console.log("[MediaUpdate] applyMediaResponse — raw payload:", JSON.stringify(payload));
+      const resolvedMic = payload
+        ? typeof payload.isMicOn === "boolean"
           ? payload.isMicOn
           : typeof payload.micOn === "boolean"
-          ? payload.micOn
-          : nextMicOn;
-      const resolvedCam =
-        typeof payload.isCameraOn === "boolean"
+            ? payload.micOn
+            : nextMicOn
+        : nextMicOn;
+      const resolvedCam = payload
+        ? typeof payload.isCameraOn === "boolean"
           ? payload.isCameraOn
           : typeof payload.cameraOn === "boolean"
-          ? payload.cameraOn
-          : nextCamOn;
+            ? payload.cameraOn
+            : nextCamOn
+        : nextCamOn;
 
+      console.log("[MediaUpdate] resolved — mic:", resolvedMic, "(wanted:", nextMicOn, ") | cam:", resolvedCam, "(wanted:", nextCamOn, ")");
+      if (nextMicOn && !resolvedMic) {
+        console.warn("[MediaUpdate] SERVER OVERRODE MIC — server returned isMicOn=false despite requesting true. Check muteOnJoin policy or host mute lock.");
+      }
       setIsMicOn(resolvedMic);
       setIsCamOn(resolvedCam);
       setLocalParticipantState(resolvedMic, resolvedCam);
@@ -1023,15 +1060,19 @@ export default function CallRoomScreen() {
         }
       );
 
+    console.log("[MediaUpdate] Sending PATCH — nextMicOn:", nextMicOn, "nextCamOn:", nextCamOn, "| pendingRef set to true");
+    pendingMediaUpdateRef.current = true;
     try {
       const response = await sendMediaPatch();
+      console.log("[MediaUpdate] PATCH success — response.data:", JSON.stringify(response.data));
       applyMediaResponse(response.data?.data);
       return;
     } catch (err) {
       const apiError = err as AxiosError<ApiErrorResponse>;
+      console.warn("[MediaUpdate] PATCH failed — status:", apiError?.response?.status, "| message:", apiError?.response?.data?.message);
       if (isMeetingEndedError(apiError)) {
         meetingEndedRef.current = true;
-        setMediaInfo("Could not sync microphone/camera. Retrying room state...");
+        setMeetingEndedReason("This meeting has been ended by the host.");
         return;
       }
       const isMissingSession =
@@ -1039,25 +1080,37 @@ export default function CallRoomScreen() {
         (apiError?.response?.data?.message || "")
           .toLowerCase()
           .includes("participant session not found");
+      console.log("[MediaUpdate] isMissingSession:", isMissingSession);
       if (!isMissingSession) throw err;
+    } finally {
+      pendingMediaUpdateRef.current = false;
+      console.log("[MediaUpdate] pendingMediaUpdateRef reset to false (first try block)");
     }
 
+    console.log("[MediaUpdate] Session missing — attempting restoreMySession");
     const restored = await restoreMySession(activeRoomId, nextMicOn, nextCamOn);
     if (!restored) {
       throw new Error("Failed to restore meeting session.");
     }
 
+    pendingMediaUpdateRef.current = true;
+    console.log("[MediaUpdate] Retrying PATCH after session restore");
     try {
       const retry = await sendMediaPatch();
+      console.log("[MediaUpdate] Retry PATCH success — response.data:", JSON.stringify(retry.data));
       applyMediaResponse(retry.data?.data);
     } catch (err) {
       const apiError = err as AxiosError<ApiErrorResponse>;
+      console.warn("[MediaUpdate] Retry PATCH failed — status:", apiError?.response?.status, "| message:", apiError?.response?.data?.message);
       if (isMeetingEndedError(apiError)) {
         meetingEndedRef.current = true;
-        setMediaInfo("Could not sync microphone/camera. Retrying room state...");
+        setMeetingEndedReason("This meeting has been ended by the host.");
         return;
       }
       throw err;
+    } finally {
+      pendingMediaUpdateRef.current = false;
+      console.log("[MediaUpdate] pendingMediaUpdateRef reset to false (retry block)");
     }
   };
 
@@ -1175,6 +1228,8 @@ export default function CallRoomScreen() {
     }
   };
 
+  const router = useRouter();
+
   const leaveCall = async () => {
     const activeRoomId = roomId;
     if (activeRoomId && !meetingEndedRef.current) {
@@ -1189,6 +1244,7 @@ export default function CallRoomScreen() {
     }
     clearMeetingLocally();
     meetingEndedRef.current = false;
+    router.replace("/");
   };
 
   const endMeeting = async () => {
@@ -1199,11 +1255,17 @@ export default function CallRoomScreen() {
       Alert.alert("End Failed", "Could not end this meeting right now.");
       return;
     }
-    await leaveCall();
+    clearMeetingLocally();
+    meetingEndedRef.current = false;
+    Alert.alert("Meeting Ended", "You have ended the meeting for all participants.", [
+      { text: "OK", onPress: () => router.replace("/") },
+    ]);
   };
 
   const toggleLocalMic = () => {
+    console.log("[MicToggle] pressed — isMicOn:", isMicOn, "| canUnmuteSelf:", canUnmuteSelf, "| phase:", phase, "| roomId:", roomId);
     if (!isMicOn && !canUnmuteSelf) {
+      console.log("[MicToggle] BLOCKED — canUnmuteSelf is false");
       Alert.alert(
         "Cannot Unmute",
         "Unmute is currently disabled for your participant role."
@@ -1211,7 +1273,10 @@ export default function CallRoomScreen() {
       return;
     }
     const nextMic = !isMicOn;
-    if (nextMic && getMicrophonePermissionStatus() !== "granted") {
+    const micPermStatus = getMicrophonePermissionStatus();
+    console.log("[MicToggle] nextMic:", nextMic, "| micPermStatus:", micPermStatus);
+    if (nextMic && micPermStatus !== "granted") {
+      console.log("[MicToggle] BLOCKED — mic permission not granted, requesting...");
       const promptMicSettings = () =>
         Alert.alert(
           "Microphone Permission Needed",
@@ -1229,6 +1294,7 @@ export default function CallRoomScreen() {
 
       void requestMicrophonePermission()
         .then((permission) => {
+          console.log("[MicToggle] Permission result:", permission.status);
           if (permission.status !== "granted") {
             promptMicSettings();
           }
@@ -1238,16 +1304,24 @@ export default function CallRoomScreen() {
         });
       return;
     }
+    console.log("[MicToggle] Applying optimistic state — setIsMicOn(", nextMic, ")");
     setIsMicOn(nextMic);
     setLocalParticipantState(nextMic, isCamOn);
     setTrackEnabled("audio", nextMic);
-    if (phase === "inCall" && nextMic && !hasTrack("audio")) {
+    const audioTrackPresent = hasTrack("audio");
+    console.log("[MicToggle] hasTrack(audio):", audioTrackPresent, "| localStream:", localStream ? `${localStream.getTracks().length} tracks` : "null");
+    if (phase === "inCall" && nextMic && !audioTrackPresent) {
+      console.log("[MicToggle] No audio track — starting local media");
       void startOrRefreshLocalMedia({ audio: nextMic, video: isCamOn });
     }
     if (phase === "inCall" && roomId) {
-      void updateParticipantMedia(roomId, nextMic, isCamOn).catch(() => {
+      console.log("[MicToggle] Calling updateParticipantMedia — roomId:", roomId, "nextMic:", nextMic, "isCamOn:", isCamOn);
+      void updateParticipantMedia(roomId, nextMic, isCamOn).catch((err) => {
+        console.warn("[MicToggle] updateParticipantMedia threw, falling back to fetchMeetingState:", err);
         void fetchMeetingState(roomId);
       });
+    } else {
+      console.log("[MicToggle] NOT sending PATCH — phase:", phase, "roomId:", roomId);
     }
   };
 
@@ -1307,10 +1381,10 @@ export default function CallRoomScreen() {
             prev.map((item) =>
               item.id === mine.id
                 ? {
-                    ...item,
-                    id: saved.id,
-                    sentAt: saved.sentAt || item.sentAt,
-                  }
+                  ...item,
+                  id: saved.id,
+                  sentAt: saved.sentAt || item.sentAt,
+                }
                 : item
             )
           );
@@ -1345,8 +1419,8 @@ export default function CallRoomScreen() {
                 {isResolvingInvite
                   ? "Validating invite link..."
                   : inviteRequiresPassword
-                  ? "This invite requires a meeting password."
-                  : "Invite ready. Configure mic/camera and join."}
+                    ? "This invite requires a meeting password."
+                    : "Invite ready. Configure mic/camera and join."}
               </Text>
             ) : null}
           </View>
@@ -1375,8 +1449,8 @@ export default function CallRoomScreen() {
                   isMicPreJoinLocked
                     ? "Microphone unmute unavailable before join"
                     : isMicOn
-                    ? "Mute microphone before join"
-                    : "Unmute microphone before join"
+                      ? "Mute microphone before join"
+                      : "Unmute microphone before join"
                 }
                 accessibilityState={{ disabled: isMicPreJoinLocked }}
               >
@@ -1387,8 +1461,8 @@ export default function CallRoomScreen() {
                     isMicPreJoinLocked
                       ? colors.textMuted
                       : isMicOn
-                      ? colors.primaryDark
-                      : "#DC0000"
+                        ? colors.primaryDark
+                        : "#DC0000"
                   }
                 />
                 <Text style={styles.preToggleText}>{isMicOn ? "Mic On" : "Mic Off"}</Text>
@@ -1406,8 +1480,8 @@ export default function CallRoomScreen() {
                   isCamPreJoinLocked
                     ? "Camera start unavailable before join"
                     : isCamOn
-                    ? "Turn camera off before join"
-                    : "Turn camera on before join"
+                      ? "Turn camera off before join"
+                      : "Turn camera on before join"
                 }
                 accessibilityState={{ disabled: isCamPreJoinLocked }}
               >
@@ -1418,8 +1492,8 @@ export default function CallRoomScreen() {
                     isCamPreJoinLocked
                       ? colors.textMuted
                       : isCamOn
-                      ? colors.primaryDark
-                      : "#DC0000"
+                        ? colors.primaryDark
+                        : "#DC0000"
                   }
                 />
                 <Text style={styles.preToggleText}>
@@ -1472,7 +1546,7 @@ export default function CallRoomScreen() {
                 style={[
                   styles.primaryBtn,
                   (!joinRoomId.trim() || isJoiningMeeting || isResolvingInvite) &&
-                    styles.disabledBtn,
+                  styles.disabledBtn,
                 ]}
                 disabled={!joinRoomId.trim() || isJoiningMeeting || isResolvingInvite}
                 onPress={joinMeeting}
@@ -1648,8 +1722,8 @@ export default function CallRoomScreen() {
             !isMicOn && !canUnmuteSelf
               ? "Unmute unavailable"
               : isMicOn
-              ? "Mute microphone"
-              : "Unmute microphone"
+                ? "Mute microphone"
+                : "Unmute microphone"
           }
         />
         <ControlButton
@@ -1663,8 +1737,8 @@ export default function CallRoomScreen() {
             !isCamOn && !canStartVideo
               ? "Camera start unavailable"
               : isCamOn
-              ? "Turn camera off"
-              : "Turn camera on"
+                ? "Turn camera off"
+                : "Turn camera on"
           }
         />
         <ControlButton
@@ -1677,8 +1751,8 @@ export default function CallRoomScreen() {
             !isShareRequested && !canScreenShare
               ? "Screen share unavailable"
               : isShareRequested
-              ? "Stop screen sharing"
-              : "Start screen sharing"
+                ? "Stop screen sharing"
+                : "Start screen sharing"
           }
         />
         <ControlButton
@@ -1749,8 +1823,8 @@ export default function CallRoomScreen() {
                 !canUseRecording && !isRecording
                   ? "Recording not available on your plan"
                   : isRecording
-                  ? "Stop recording"
-                  : "Start recording"
+                    ? "Stop recording"
+                    : "Start recording"
               }
               accessibilityState={{ disabled: !canUseRecording && !isRecording }}
             >
@@ -1761,8 +1835,8 @@ export default function CallRoomScreen() {
                   !canUseRecording && !isRecording
                     ? colors.textMuted
                     : isRecording
-                    ? "#fff"
-                    : "#DC0000"
+                      ? "#fff"
+                      : "#DC0000"
                 }
               />
               <Text
@@ -1775,8 +1849,8 @@ export default function CallRoomScreen() {
                 {!canUseRecording && !isRecording
                   ? "Recording Locked (Current Plan)"
                   : isRecording
-                  ? "Stop Recording"
-                  : "Record Meeting"}
+                    ? "Stop Recording"
+                    : "Record Meeting"}
               </Text>
             </Pressable>
             {lastRecordingPath ? (
@@ -1825,46 +1899,115 @@ export default function CallRoomScreen() {
 
       {chatOpen ? (
         <View style={styles.chatOverlay}>
-          <KeyboardAvoidingView behavior="padding" keyboardVerticalOffset={84}>
+          <KeyboardAvoidingView
+            behavior="padding"
+            style={{ flex: 1, justifyContent: "flex-end" }}
+          >
             <View style={styles.chatPanel}>
-              <View style={styles.panelHeader}>
-                <Text style={styles.panelTitle}>Meeting Chat</Text>
-                <Pressable onPress={() => setChatOpen(false)}>
-                  <Ionicons name="close" size={20} color={colors.text} />
+              {/* ── Header ── */}
+              <View style={styles.chatHeader}>
+                <View style={styles.chatHeaderLeft}>
+                  <View style={styles.chatHeaderDot} />
+                  <Text style={styles.chatHeaderTitle}>Meeting Chat</Text>
+                  {chatMessages.length > 0 && (
+                    <View style={styles.chatBadge}>
+                      <Text style={styles.chatBadgeText}>{chatMessages.length}</Text>
+                    </View>
+                  )}
+                </View>
+                <Pressable
+                  onPress={() => setChatOpen(false)}
+                  style={styles.chatCloseBtn}
+                  hitSlop={10}
+                >
+                  <Ionicons name="close" size={18} color="#A8C8F0" />
                 </Pressable>
               </View>
 
-              <ScrollView style={styles.chatBody}>
-                {chatMessages.map((msg) => (
-                  <View
-                    key={msg.id}
-                    style={[
-                      styles.chatBubble,
-                      msg.mine ? styles.chatBubbleMine : styles.chatBubbleRemote,
-                    ]}
-                  >
-                    {!msg.mine ? <Text style={styles.chatSender}>{msg.senderName}</Text> : null}
-                    <Text style={[styles.chatText, msg.mine && { color: "#fff" }]}>
-                      {msg.text}
-                    </Text>
-                  </View>
-                ))}
-              </ScrollView>
+              {/* ── Divider ── */}
+              <View style={styles.chatDivider} />
 
+              {/* ── Messages ── */}
+              {chatMessages.length === 0 ? (
+                <View style={styles.chatEmptyState}>
+                  <View style={styles.chatEmptyIcon}>
+                    <Ionicons name="chatbubbles-outline" size={34} color="#3A6A9E" />
+                  </View>
+                  <Text style={styles.chatEmptyTitle}>No messages yet</Text>
+                  <Text style={styles.chatEmptySubtitle}>Say something to the group 👋</Text>
+                </View>
+              ) : (
+                <FlatList
+                  data={[...chatMessages].reverse()}
+                  keyExtractor={(item) => item.id}
+                  inverted
+                  style={styles.chatList}
+                  contentContainerStyle={styles.chatListContent}
+                  showsVerticalScrollIndicator={false}
+                  renderItem={({ item: msg }) => {
+                    const initials = msg.senderName
+                      .split(" ")
+                      .map((w) => w[0])
+                      .join("")
+                      .slice(0, 2)
+                      .toUpperCase();
+                    const timeStr = new Date(msg.sentAt).toLocaleTimeString([], {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    });
+                    if (msg.mine) {
+                      return (
+                        <View style={styles.chatRowMine}>
+                          <View style={styles.chatBubbleMineWrap}>
+                            <Text style={styles.chatBubbleMineText}>{msg.text}</Text>
+                            <Text style={styles.chatTimeMine}>{timeStr}</Text>
+                          </View>
+                        </View>
+                      );
+                    }
+                    return (
+                      <View style={styles.chatRowRemote}>
+                        <View style={styles.chatAvatar}>
+                          <Text style={styles.chatAvatarText}>{initials}</Text>
+                        </View>
+                        <View style={styles.chatBubbleRemoteWrap}>
+                          <Text style={styles.chatSenderName}>{msg.senderName}</Text>
+                          <Text style={styles.chatBubbleRemoteText}>{msg.text}</Text>
+                          <Text style={styles.chatTimeRemote}>{timeStr}</Text>
+                        </View>
+                      </View>
+                    );
+                  }}
+                />
+              )}
+
+              {/* ── Composer ── */}
               <View style={styles.chatComposer}>
                 <TextInput
                   value={draftMessage}
                   onChangeText={setDraftMessage}
+                  onSubmitEditing={sendChat}
                   style={styles.chatInput}
-                  placeholder="Message everyone..."
-                  placeholderTextColor={colors.textMuted}
+                  placeholder="Message everyone…"
+                  placeholderTextColor="#3A6A9E"
+                  multiline
+                  maxLength={500}
+                  returnKeyType="send"
+                  blurOnSubmit={false}
                 />
                 <Pressable
                   onPress={sendChat}
-                  style={[styles.chatSendBtn, !draftMessage.trim() && styles.disabledBtn]}
                   disabled={!draftMessage.trim()}
+                  style={[
+                    styles.chatSendBtn,
+                    !draftMessage.trim() && styles.chatSendBtnDisabled,
+                  ]}
                 >
-                  <Ionicons name="send" size={15} color="#fff" />
+                  <Ionicons
+                    name="send"
+                    size={16}
+                    color={draftMessage.trim() ? "#fff" : "#2A4A6E"}
+                  />
                 </Pressable>
               </View>
             </View>
@@ -2388,74 +2531,238 @@ const styles = StyleSheet.create({
   chatOverlay: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: "flex-end",
-    backgroundColor: "rgba(5, 12, 20, 0.4)",
+    backgroundColor: "rgba(4, 10, 18, 0.55)",
+    zIndex: 30,
   },
   chatPanel: {
-    backgroundColor: colors.surface,
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
-    padding: 12,
-    gap: 8,
-    maxHeight: "58%",
+    backgroundColor: "#0D1F35",
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    borderTopWidth: 1,
+    borderLeftWidth: 1,
+    borderRightWidth: 1,
+    borderColor: "#1E3D60",
+    maxHeight: "70%",
+    paddingBottom: 8,
+    overflow: "hidden",
   },
-  chatBody: {
-    maxHeight: 250,
+  // ── Header ──
+  chatHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 10,
   },
-  chatBubble: {
-    marginBottom: 8,
-    borderRadius: 12,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    maxWidth: "90%",
-  },
-  chatBubbleMine: {
-    alignSelf: "flex-end",
-    backgroundColor: colors.primary,
-  },
-  chatBubbleRemote: {
-    alignSelf: "flex-start",
-    backgroundColor: colors.surfaceSoft,
-    borderWidth: 1,
-    borderColor: colors.stroke,
-  },
-  chatSender: {
-    color: colors.textMuted,
-    fontFamily: type.body,
-    fontSize: 10,
-    fontWeight: "700",
-    marginBottom: 2,
-  },
-  chatText: {
-    color: colors.text,
-    fontFamily: type.body,
-    fontSize: 13,
-  },
-  chatComposer: {
+  chatHeaderLeft: {
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
   },
-  chatInput: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: colors.stroke,
-    borderRadius: 10,
-    backgroundColor: colors.surfaceSoft,
-    color: colors.text,
-    paddingHorizontal: 10,
-    paddingVertical: 10,
-    fontFamily: type.body,
-    fontSize: 14,
+  chatHeaderDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#4ADE80",
   },
-  chatSendBtn: {
-    width: 40,
-    height: 40,
+  chatHeaderTitle: {
+    color: "#EAF3FF",
+    fontFamily: type.body,
+    fontSize: 15,
+    fontWeight: "800",
+    letterSpacing: 0.2,
+  },
+  chatBadge: {
+    backgroundColor: "#1E4A7E",
     borderRadius: 10,
-    backgroundColor: colors.primary,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+  },
+  chatBadgeText: {
+    color: "#A8D4FF",
+    fontFamily: type.body,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  chatCloseBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: "#152945",
     borderWidth: 1,
-    borderColor: colors.primaryDark,
+    borderColor: "#1E3D60",
     alignItems: "center",
     justifyContent: "center",
+  },
+  chatDivider: {
+    height: 1,
+    backgroundColor: "#1A355A",
+    marginHorizontal: 0,
+  },
+  // ── Empty state ──
+  chatEmptyState: {
+    alignItems: "center",
+    paddingVertical: 40,
+    paddingHorizontal: 32,
+    gap: 10,
+  },
+  chatEmptyIcon: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: "#112135",
+    borderWidth: 1,
+    borderColor: "#1E3D60",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 4,
+  },
+  chatEmptyTitle: {
+    color: "#CBD8E8",
+    fontFamily: type.body,
+    fontSize: 15,
+    fontWeight: "800",
+  },
+  chatEmptySubtitle: {
+    color: "#4A7AAC",
+    fontFamily: type.body,
+    fontSize: 13,
+    textAlign: "center",
+  },
+  // ── Messages list ──
+  chatList: {
+    paddingHorizontal: 14,
+    paddingTop: 10,
+  },
+  chatListContent: {
+    paddingBottom: 6,
+    paddingTop: 4,
+    gap: 10,
+  },
+  // ── My bubble ──
+  chatRowMine: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+  },
+  chatBubbleMineWrap: {
+    backgroundColor: "#1A5AA8",
+    borderRadius: 18,
+    borderBottomRightRadius: 4,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    maxWidth: "78%",
+    borderWidth: 1,
+    borderColor: "#2674CC",
+  },
+  chatBubbleMineText: {
+    color: "#EAF4FF",
+    fontFamily: type.body,
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  chatTimeMine: {
+    color: "#7AADDA",
+    fontFamily: type.body,
+    fontSize: 10,
+    fontWeight: "600",
+    marginTop: 4,
+    textAlign: "right",
+  },
+  // ── Remote bubble ──
+  chatRowRemote: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 8,
+  },
+  chatAvatar: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: "#1E3D60",
+    borderWidth: 1,
+    borderColor: "#2A5580",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+  },
+  chatAvatarText: {
+    color: "#A8D4FF",
+    fontFamily: type.body,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  chatBubbleRemoteWrap: {
+    backgroundColor: "#112135",
+    borderRadius: 18,
+    borderBottomLeftRadius: 4,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    maxWidth: "78%",
+    borderWidth: 1,
+    borderColor: "#1E3D60",
+  },
+  chatSenderName: {
+    color: "#5BA3E0",
+    fontFamily: type.body,
+    fontSize: 11,
+    fontWeight: "800",
+    marginBottom: 3,
+    textTransform: "capitalize",
+  },
+  chatBubbleRemoteText: {
+    color: "#CBD8E8",
+    fontFamily: type.body,
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  chatTimeRemote: {
+    color: "#3A6A9E",
+    fontFamily: type.body,
+    fontSize: 10,
+    fontWeight: "600",
+    marginTop: 4,
+  },
+  // ── Composer ──
+  chatComposer: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 10,
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 6,
+    borderTopWidth: 1,
+    borderTopColor: "#1A355A",
+  },
+  chatInput: {
+    flex: 1,
+    backgroundColor: "#0A1929",
+    borderWidth: 1,
+    borderColor: "#1E3D60",
+    borderRadius: 22,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 10,
+    color: "#EAF3FF",
+    fontFamily: type.body,
+    fontSize: 14,
+    maxHeight: 100,
+    minHeight: 42,
+  },
+  chatSendBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: "#1A5AA8",
+    borderWidth: 1,
+    borderColor: "#2674CC",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+  },
+  chatSendBtnDisabled: {
+    backgroundColor: "#0D1F35",
+    borderColor: "#1A355A",
   },
 });
 
