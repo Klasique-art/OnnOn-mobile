@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Href, Link, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
+import { AxiosError } from "axios";
 import {
   Keyboard,
   KeyboardAvoidingView,
@@ -16,35 +17,73 @@ import {
   AppErrorMessage,
   AppForm,
   AppFormField,
+  FormLoader,
   SubmitButton,
 } from "@/src/components/forms";
+import { useAuth } from "@/context/AuthContext";
+import client from "@/lib/client";
 import { LoginFormValues, LoginValidationSchema } from "@/src/validation/authSchemas";
 import { colors, type } from "@/src/theme/colors";
 
+type LoginResponse = {
+  success: boolean;
+  message: string;
+  token: string;
+  user: {
+    id: string;
+    email: string;
+    isVerified: boolean;
+  };
+};
+
+type LoginErrorResponse = {
+  message?: string;
+};
+
+const logLoginError = (error: AxiosError<LoginErrorResponse>) => {
+  console.warn("[Login] Authentication failed", {
+    message: error.message,
+    code: error.code,
+    status: error.response?.status,
+    responseData: error.response?.data,
+  });
+};
+
 export default function LoginScreen() {
   const router = useRouter();
+  const { setToken } = useAuth();
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleSubmit = async (values: LoginFormValues, { resetForm }: any) => {
+  const handleSubmit = async (
+    values: LoginFormValues,
+    { resetForm }: { resetForm: () => void }
+  ) => {
     try {
       setIsLoading(true);
       setError(null);
 
-      await new Promise((resolve) => setTimeout(resolve, 800));
+      const response = await client.post<LoginResponse>("/users/login", {
+        email: values.email.trim(),
+        password: values.password,
+      });
 
-      if (
-        values.emailOrUsername.toLowerCase() === "blocked@example.com" ||
-        values.password.toLowerCase() === "wrongpass"
-      ) {
-        throw new Error("Invalid credentials");
-      }
-
+      await setToken(response.data.token);
       resetForm();
       router.replace("/(app)/(tabs)/home" as Href);
-    } catch {
-      setError("Login failed. Please check your credentials and try again.");
+    } catch (err) {
+      const apiError = err as AxiosError<LoginErrorResponse>;
+      const apiMessage = apiError.response?.data?.message;
+      logLoginError(apiError);
+
+      if (apiMessage) {
+        setError(apiMessage);
+      } else if (apiError.code === "ECONNABORTED") {
+        setError("Login timed out. Please try again.");
+      } else {
+        setError("Login failed. Please check your credentials and try again.");
+      }
     } finally {
       setIsLoading(false);
     }
@@ -81,8 +120,9 @@ export default function LoginScreen() {
             </View>
 
             <View style={styles.formCard}>
+              <FormLoader visible={isLoading} label="Signing in..." />
               <AppForm<LoginFormValues>
-                initialValues={{ emailOrUsername: "", password: "" }}
+                initialValues={{ email: "", password: "" }}
                 onSubmit={handleSubmit}
                 validationSchema={LoginValidationSchema}
               >
@@ -90,13 +130,13 @@ export default function LoginScreen() {
                   <AppErrorMessage error={error || undefined} visible={!!error} />
 
                   <AppFormField
-                    name="emailOrUsername"
-                    label="Email or Username"
-                    placeholder="Enter email or username"
+                    name="email"
+                    label="Email"
+                    placeholder="Enter email"
                     autoCapitalize="none"
                     autoCorrect={false}
                     keyboardType="email-address"
-                    textContentType="username"
+                    textContentType="emailAddress"
                   />
 
                   <AppFormField
@@ -206,6 +246,7 @@ const styles = StyleSheet.create({
     maxWidth: 280,
   },
   formCard: {
+    position: "relative",
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.stroke,

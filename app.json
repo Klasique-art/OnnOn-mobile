@@ -11,6 +11,9 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.shopwit.OnnOn",
+      "associatedDomains": [
+        "applinks:onnon.app"
+      ],
       "infoPlist": {
         "NSCameraUsageDescription": "OnnOn needs camera access for video meetings.",
         "NSMicrophoneUsageDescription": "OnnOn needs microphone access for meeting audio."
@@ -24,6 +27,23 @@
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "https",
+              "host": "onnon.app",
+              "pathPrefix": "/meeting"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ],
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "permissions": [

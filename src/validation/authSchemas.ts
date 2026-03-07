@@ -1,20 +1,17 @@
 import * as Yup from "yup";
 
 export type LoginFormValues = {
-  emailOrUsername: string;
+  email: string;
   password: string;
 };
 
 export const LoginValidationSchema: Yup.ObjectSchema<LoginFormValues> =
   Yup.object({
-    emailOrUsername: Yup.string()
-      .trim()
-      .required("Email or username is required"),
+    email: Yup.string().trim().required("Email is required").email("Invalid email"),
     password: Yup.string().required("Password is required"),
   });
 
 export type SignupFormValues = {
-  username: string;
   email: string;
   password: string;
   confirmPassword: string;
@@ -22,10 +19,6 @@ export type SignupFormValues = {
 
 export const SignupValidationSchema: Yup.ObjectSchema<SignupFormValues> =
   Yup.object({
-    username: Yup.string()
-      .trim()
-      .required("Username is required")
-      .min(3, "Username must be at least 3 characters"),
     email: Yup.string()
       .trim()
       .required("Email is required")

@@ -8,15 +8,10 @@ export default function WelcomeScreen() {
     <PlaceholderScreen
       title="Welcome to OnnOn"
       description="A video-first collaboration app with clean rooms, calm visuals, and focused communication."
-      badge="Design Preview"
+      badge="Get Started"
       showBack={false}
       footer={
         <View style={styles.actions}>
-          <Link href="/(app)/(tabs)/home" asChild>
-            <Pressable style={styles.primaryButton}>
-              <Text style={styles.primaryText}>Enter App (Simulate)</Text>
-            </Pressable>
-          </Link>
           <Link href="/(auth)/login" asChild>
             <Pressable style={styles.secondaryButton}>
               <Text style={styles.secondaryText}>Go to Login</Text>
@@ -37,21 +32,6 @@ const styles = StyleSheet.create({
   actions: {
     marginTop: 18,
     gap: 10,
-  },
-  primaryButton: {
-    backgroundColor: colors.primary,
-    borderRadius: 14,
-    paddingVertical: 14,
-    alignItems: "center",
-    borderWidth: 1,
-    borderColor: colors.primaryDark,
-  },
-  primaryText: {
-    color: colors.primaryText,
-    fontFamily: type.body,
-    fontSize: 15,
-    fontWeight: "600",
-    letterSpacing: 0.2,
   },
   secondaryButton: {
     backgroundColor: colors.surface,

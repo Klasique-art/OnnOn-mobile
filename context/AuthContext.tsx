@@ -1,6 +1,7 @@
 import React, {
   createContext,
   ReactNode,
+  useEffect,
   useContext,
   useMemo,
   useState,
@@ -22,6 +23,17 @@ type AuthProviderProps = {
 
 export function AuthProvider({ children }: AuthProviderProps) {
   const [token, setTokenState] = useState<string | null>(null);
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    const restoreToken = async () => {
+      const storedToken = await authStorage.getToken();
+      setTokenState(storedToken);
+      setHydrated(true);
+    };
+
+    restoreToken();
+  }, []);
 
   const setToken = async (nextToken: string | null) => {
     if (nextToken) {
@@ -40,6 +52,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }),
     [token]
   );
+
+  if (!hydrated) return null;
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

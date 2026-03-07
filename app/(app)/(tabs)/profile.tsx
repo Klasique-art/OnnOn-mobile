@@ -1,45 +1,199 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "expo-router";
 import * as ImagePicker from "expo-image-picker";
 import { Image } from "expo-image";
+import { Ionicons } from "@expo/vector-icons";
+import { AxiosError } from "axios";
 import {
+  ActivityIndicator,
   Alert,
   KeyboardAvoidingView,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Switch,
   Text,
   TextInput,
   View,
+  useWindowDimensions,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+
+import { useAuth } from "@/context/AuthContext";
+import client from "@/lib/client";
+import { FormLoader } from "@/src/components/forms";
 import { colors, type } from "@/src/theme/colors";
-import { MockProfile, mockProfile } from "@/src/data/mockProfile";
+
+type ProfileTheme = "light" | "dark";
+
+type ProfilePreferences = {
+  theme: ProfileTheme;
+  notifications: boolean;
+  audioDefault: boolean;
+  videoDefault: boolean;
+};
+
+type ProfileData = {
+  _id: string;
+  userId: string;
+  email: string;
+  displayName: string;
+  avatar: string | null;
+  bio: string;
+  preferences: ProfilePreferences;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type ProfileResponse = {
+  success: boolean;
+  message?: string;
+  data: ProfileData;
+};
+
+type ApiErrorResponse = {
+  success?: boolean;
+  message?: string;
+};
+
+type DraftProfile = {
+  displayName: string;
+  bio: string;
+  avatar: string | null;
+  preferences: ProfilePreferences;
+};
+
+const DEFAULT_PREFERENCES: ProfilePreferences = {
+  theme: "light",
+  notifications: true,
+  audioDefault: true,
+  videoDefault: true,
+};
+
+const toDraftProfile = (profile: ProfileData): DraftProfile => ({
+  displayName: profile.displayName ?? "",
+  bio: profile.bio ?? "",
+  avatar: profile.avatar ?? null,
+  preferences: {
+    theme: profile.preferences?.theme ?? DEFAULT_PREFERENCES.theme,
+    notifications:
+      profile.preferences?.notifications ?? DEFAULT_PREFERENCES.notifications,
+    audioDefault:
+      profile.preferences?.audioDefault ?? DEFAULT_PREFERENCES.audioDefault,
+    videoDefault:
+      profile.preferences?.videoDefault ?? DEFAULT_PREFERENCES.videoDefault,
+  },
+});
+
+const getErrorMessage = (
+  error: AxiosError<ApiErrorResponse>,
+  fallback: string
+) => error.response?.data?.message || fallback;
+
+const logProfileError = (label: string, err: unknown, context?: object) => {
+  const apiError = err as AxiosError<ApiErrorResponse>;
+  console.error(label, {
+    ...context,
+    message: apiError?.message || String(err),
+    code: apiError?.code,
+    status: apiError?.response?.status,
+    responseData: apiError?.response?.data,
+  });
+};
 
 export default function ProfileScreen() {
   const router = useRouter();
-  const [savedProfile, setSavedProfile] = useState<MockProfile>(mockProfile);
-  const [draft, setDraft] = useState<MockProfile>(mockProfile);
-  const [isSaving, setIsSaving] = useState(false);
+  const { setToken } = useAuth();
+  const { width } = useWindowDimensions();
+  const isCompact = width < 370;
+
+  const [profile, setProfile] = useState<ProfileData | null>(null);
+  const [draft, setDraft] = useState<DraftProfile | null>(null);
+  const [isLoadingProfile, setIsLoadingProfile] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
+  const [isRemovingAvatar, setIsRemovingAvatar] = useState(false);
+  const [screenError, setScreenError] = useState<string | null>(null);
+
+  const isBusy = isSaving || isUploadingAvatar || isRemovingAvatar;
+
+  const loadProfile = async (showRefresh = false) => {
+    if (showRefresh) setIsRefreshing(true);
+    else setIsLoadingProfile(true);
+
+    try {
+      setScreenError(null);
+      const response = await client.get<ProfileResponse>("/profile/me");
+      setProfile(response.data.data);
+      setDraft(toDraftProfile(response.data.data));
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      logProfileError("[Profile] Failed to fetch profile", err);
+      setScreenError(getErrorMessage(apiError, "Could not load profile."));
+    } finally {
+      if (showRefresh) setIsRefreshing(false);
+      else setIsLoadingProfile(false);
+    }
+  };
+
+  useEffect(() => {
+    loadProfile();
+  }, []);
+
+  const hasChanges = useMemo(() => {
+    if (!profile || !draft) return false;
+    const original = toDraftProfile(profile);
+    return JSON.stringify(original) !== JSON.stringify(draft);
+  }, [draft, profile]);
 
   const initials = useMemo(() => {
-    const parts = draft.displayName.trim().split(" ").filter(Boolean);
-    if (parts.length === 0) return "U";
+    const source = draft?.displayName?.trim() || "User";
+    const parts = source.split(" ").filter(Boolean);
     if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-    return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
-  }, [draft.displayName]);
+    return `${parts[0][0] || "U"}${parts[1][0] || ""}`.toUpperCase();
+  }, [draft?.displayName]);
 
-  const hasChanges = useMemo(
-    () => JSON.stringify(draft) !== JSON.stringify(savedProfile),
-    [draft, savedProfile]
-  );
+  const onSaveProfile = async () => {
+    if (!draft) return;
+    if (draft.displayName.trim().length < 2) {
+      setScreenError("Display name must be at least 2 characters.");
+      return;
+    }
 
-  const pickAvatar = async () => {
+    try {
+      setIsSaving(true);
+      setScreenError(null);
+
+      const payload = {
+        displayName: draft.displayName.trim(),
+        bio: draft.bio.trim(),
+        preferences: draft.preferences,
+      };
+
+      const response = await client.put<ProfileResponse>("/profile/me", payload);
+      setProfile(response.data.data);
+      setDraft(toDraftProfile(response.data.data));
+      setIsEditing(false);
+      Alert.alert("Profile Updated", "Your profile changes were saved.");
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      logProfileError("[Profile] Failed to update profile", err);
+      setScreenError(getErrorMessage(apiError, "Could not update profile."));
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const onPickAvatar = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      Alert.alert("Permission needed", "Allow photo access to choose an avatar.");
+      Alert.alert(
+        "Photo Permission Needed",
+        "Allow photo access in settings to upload an avatar."
+      );
       return;
     }
 
@@ -47,39 +201,106 @@ export default function ProfileScreen() {
       mediaTypes: ["images"],
       allowsEditing: true,
       aspect: [1, 1],
-      quality: 0.8,
+      quality: 0.85,
     });
 
     if (result.canceled || !result.assets?.[0]?.uri) return;
 
-    setDraft((prev) => ({ ...prev, avatarUri: result.assets[0].uri }));
+    try {
+      const selected = result.assets[0];
+      const uri = selected.uri;
+      const fileName = selected.fileName || `avatar-${Date.now()}.jpg`;
+      const mimeType = selected.mimeType || "image/jpeg";
+      const formData = new FormData();
+      formData.append("avatar", {
+        uri,
+        name: fileName,
+        type: mimeType,
+      } as never);
+
+      setIsUploadingAvatar(true);
+      setScreenError(null);
+      const response = await client.post<ProfileResponse>("/profile/avatar", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      setProfile(response.data.data);
+      setDraft(toDraftProfile(response.data.data));
+      Alert.alert("Avatar Updated", "Profile photo changed successfully.");
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      logProfileError("[Profile] Failed to upload avatar", err, {
+        selectedAsset: result.assets[0],
+      });
+      setScreenError(getErrorMessage(apiError, "Could not upload avatar."));
+    } finally {
+      setIsUploadingAvatar(false);
+    }
   };
 
-  const removeAvatar = () => {
-    setDraft((prev) => ({ ...prev, avatarUri: null }));
+  const onRemoveAvatar = () => {
+    Alert.alert(
+      "Remove Avatar",
+      "This will reset your avatar to the default image.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              setIsRemovingAvatar(true);
+              setScreenError(null);
+              const response = await client.delete<ProfileResponse>("/profile/avatar");
+              setProfile(response.data.data);
+              setDraft(toDraftProfile(response.data.data));
+            } catch (err) {
+              const apiError = err as AxiosError<ApiErrorResponse>;
+              logProfileError("[Profile] Failed to remove avatar", err);
+              setScreenError(getErrorMessage(apiError, "Could not remove avatar."));
+            } finally {
+              setIsRemovingAvatar(false);
+            }
+          },
+        },
+      ]
+    );
   };
 
-  const saveProfile = async () => {
-    setIsSaving(true);
-    await new Promise((resolve) => setTimeout(resolve, 700));
-    setSavedProfile(draft);
-    setIsSaving(false);
+  const onCancelEdit = () => {
+    if (!profile) return;
+    setDraft(toDraftProfile(profile));
     setIsEditing(false);
-    Alert.alert("Saved", "Profile changes stored in simulation mode.");
+    setScreenError(null);
   };
 
-  const resetChanges = () => {
-    setDraft(savedProfile);
-  };
-
-  const cancelEditing = () => {
-    setDraft(savedProfile);
-    setIsEditing(false);
-  };
-
-  const logout = () => {
+  const onLogout = async () => {
+    await setToken(null);
     router.replace("/(auth)/welcome");
   };
+
+  if (isLoadingProfile && !draft) {
+    return (
+      <SafeAreaView style={styles.screen} edges={["top", "left", "right", "bottom"]}>
+        <View style={styles.centeredState}>
+          <ActivityIndicator size="large" color={colors.primaryDark} />
+          <Text style={styles.stateText}>Loading your profile...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (!draft) {
+    return (
+      <SafeAreaView style={styles.screen} edges={["top", "left", "right", "bottom"]}>
+        <View style={styles.centeredState}>
+          <Text style={styles.stateText}>Profile unavailable.</Text>
+          <Pressable onPress={() => loadProfile()} style={styles.retryButton}>
+            <Text style={styles.retryButtonText}>Retry</Text>
+          </Pressable>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.screen} edges={["top", "left", "right", "bottom"]}>
@@ -89,262 +310,246 @@ export default function ProfileScreen() {
         keyboardVerticalOffset={76}
       >
         <ScrollView
-          contentContainerStyle={styles.content}
+          contentContainerStyle={[styles.content, isCompact && styles.contentCompact]}
           keyboardShouldPersistTaps="handled"
+          refreshControl={
+            <RefreshControl
+              refreshing={isRefreshing}
+              onRefresh={() => loadProfile(true)}
+              tintColor={colors.primaryDark}
+            />
+          }
         >
           <View style={styles.bgOrbTop} />
           <View style={styles.bgOrbBottom} />
 
           <View style={styles.header}>
-            <Text style={styles.kicker}>Profile</Text>
-            <Text style={styles.title}>Personal settings</Text>
+            <Text style={styles.kicker}>Account</Text>
+            <Text style={styles.title}>Your Profile</Text>
             <Text style={styles.subtitle}>
-              Edit identity, meeting defaults, and account preferences.
+              Manage personal details, profile photo, and meeting defaults.
             </Text>
           </View>
 
-          <View style={styles.card}>
-            <View style={styles.profileRow}>
+          <View style={styles.heroCard}>
+            <FormLoader
+              visible={isBusy}
+              label={
+                isSaving
+                  ? "Saving profile..."
+                  : isUploadingAvatar
+                    ? "Uploading photo..."
+                    : "Removing photo..."
+              }
+            />
+            <View style={styles.heroTopRow}>
               <View style={styles.avatarShell}>
-                {draft.avatarUri ? (
-                  <Image source={{ uri: draft.avatarUri }} style={styles.avatarImage} />
+                {draft.avatar ? (
+                  <Image source={{ uri: draft.avatar }} style={styles.avatarImage} />
                 ) : (
                   <Text style={styles.avatarInitials}>{initials}</Text>
                 )}
               </View>
-
-              <View style={styles.profileMeta}>
-                <Text style={styles.name}>{draft.displayName || "Unnamed User"}</Text>
-                <View style={styles.badgeRow}>
-                  <View style={styles.roleBadge}>
-                    <Text style={styles.roleBadgeText}>{draft.role}</Text>
-                  </View>
-                  {draft.isVerified ? (
-                    <View style={styles.verifiedBadge}>
-                      <Text style={styles.verifiedText}>Verified</Text>
-                    </View>
-                  ) : null}
-                </View>
+              <View style={styles.heroTextWrap}>
+                <Text style={styles.heroName}>
+                  {draft.displayName.trim() || "Unnamed User"}
+                </Text>
+                <Text style={styles.heroMeta}>User ID: {profile?.userId || "-"}</Text>
               </View>
             </View>
 
-            <View style={styles.inlineActions}>
-              {isEditing ? (
-                <>
-                  <Pressable onPress={pickAvatar} style={styles.inlineActionBtn}>
-                    <Text style={styles.inlineActionText}>Change photo</Text>
-                  </Pressable>
-                  <Pressable onPress={removeAvatar} style={styles.inlineActionBtn}>
-                    <Text style={styles.inlineActionText}>Remove</Text>
-                  </Pressable>
-                </>
-              ) : (
-                <Pressable
-                  onPress={() => setIsEditing(true)}
-                  style={[styles.inlineActionBtn, styles.editCtaBtn]}
-                >
-                  <Text style={styles.inlineActionText}>Edit profile</Text>
-                </Pressable>
-              )}
+            <View style={[styles.avatarActions, isCompact && styles.avatarActionsCompact]}>
+              <Pressable
+                style={[styles.ghostButton, styles.avatarActionButton]}
+                onPress={onPickAvatar}
+                accessibilityRole="button"
+                accessibilityLabel="Change profile photo"
+              >
+                <Ionicons name="image-outline" size={15} color={colors.text} />
+                <Text style={styles.ghostButtonText}>Change Photo</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.dangerButton, styles.avatarActionButton]}
+                onPress={onRemoveAvatar}
+                accessibilityRole="button"
+                accessibilityLabel="Remove profile photo"
+              >
+                <Ionicons name="trash-outline" size={15} color={colors.error} />
+                <Text style={styles.dangerButtonText}>Remove</Text>
+              </Pressable>
             </View>
           </View>
+
+          {screenError ? (
+            <View style={styles.errorBanner} accessibilityLiveRegion="polite">
+              <Ionicons name="alert-circle-outline" size={16} color={colors.error} />
+              <Text style={styles.errorBannerText}>{screenError}</Text>
+            </View>
+          ) : null}
 
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Basic Info</Text>
 
-            <Text style={styles.fieldLabel}>Display name</Text>
+            <Text style={styles.fieldLabel}>Email</Text>
+            <View style={styles.readOnlyField}>
+              <Text style={styles.readOnlyText}>{profile?.email || "-"}</Text>
+            </View>
+
+            <Text style={styles.fieldLabel}>Display Name</Text>
             <TextInput
               value={draft.displayName}
-              onChangeText={(value) => setDraft((prev) => ({ ...prev, displayName: value }))}
+              onChangeText={(value) =>
+                setDraft((prev) => (prev ? { ...prev, displayName: value } : prev))
+              }
               style={[styles.input, !isEditing && styles.inputDisabled]}
               placeholder="Display name"
               placeholderTextColor={colors.textMuted}
               editable={isEditing}
+              maxLength={50}
+              accessibilityLabel="Display name"
             />
-
-            <Text style={styles.fieldLabel}>Role</Text>
-            <TextInput
-              value={draft.role}
-              onChangeText={(value) => setDraft((prev) => ({ ...prev, role: value }))}
-              style={[styles.input, !isEditing && styles.inputDisabled]}
-              placeholder="Role"
-              placeholderTextColor={colors.textMuted}
-              editable={isEditing}
-            />
-
-            <Text style={styles.fieldLabel}>Email (read-only)</Text>
-            <View style={styles.readOnlyField}>
-              <Text style={styles.readOnlyText}>{draft.email}</Text>
-            </View>
 
             <Text style={styles.fieldLabel}>Bio</Text>
             <TextInput
               value={draft.bio}
-              onChangeText={(value) => setDraft((prev) => ({ ...prev, bio: value }))}
+              onChangeText={(value) =>
+                setDraft((prev) => (prev ? { ...prev, bio: value } : prev))
+              }
               style={[styles.input, styles.textArea, !isEditing && styles.inputDisabled]}
               multiline
-              placeholder="Short bio"
+              placeholder="Tell people about you"
               placeholderTextColor={colors.textMuted}
               editable={isEditing}
+              maxLength={200}
+              accessibilityLabel="Bio"
             />
           </View>
 
           <View style={styles.card}>
-            <Text style={styles.sectionTitle}>Meeting Defaults</Text>
-            <PreferenceRow
-              label="Join with microphone"
-              value={draft.preferences.audioDefault}
-              disabled={!isEditing}
-              onChange={(value) =>
-                setDraft((prev) => ({
-                  ...prev,
-                  preferences: { ...prev.preferences, audioDefault: value },
-                }))
-              }
-            />
-            <PreferenceRow
-              label="Join with camera"
-              value={draft.preferences.videoDefault}
-              disabled={!isEditing}
-              onChange={(value) =>
-                setDraft((prev) => ({
-                  ...prev,
-                  preferences: { ...prev.preferences, videoDefault: value },
-                }))
-              }
-            />
-          </View>
-
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>App Preferences</Text>
+            <Text style={styles.sectionTitle}>Preferences</Text>
 
             <Text style={styles.fieldLabel}>Theme</Text>
             <View style={styles.segmentRow}>
-              <Pressable
-                onPress={() =>
-                  setDraft((prev) => ({
-                    ...prev,
-                    preferences: { ...prev.preferences, theme: "light" },
-                  }))
-                }
+              <ThemeButton
+                label="Light"
+                selected={draft.preferences.theme === "light"}
                 disabled={!isEditing}
-                style={[
-                  styles.segment,
-                  draft.preferences.theme === "light" && styles.segmentActive,
-                  !isEditing && styles.segmentDisabled,
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.segmentText,
-                    draft.preferences.theme === "light" && styles.segmentTextActive,
-                  ]}
-                >
-                  Light
-                </Text>
-              </Pressable>
-              <Pressable
                 onPress={() =>
-                  setDraft((prev) => ({
-                    ...prev,
-                    preferences: { ...prev.preferences, theme: "dark" },
-                  }))
+                  setDraft((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          preferences: { ...prev.preferences, theme: "light" },
+                        }
+                      : prev
+                  )
                 }
+              />
+              <ThemeButton
+                label="Dark"
+                selected={draft.preferences.theme === "dark"}
                 disabled={!isEditing}
-                style={[
-                  styles.segment,
-                  draft.preferences.theme === "dark" && styles.segmentActive,
-                  !isEditing && styles.segmentDisabled,
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.segmentText,
-                    draft.preferences.theme === "dark" && styles.segmentTextActive,
-                  ]}
-                >
-                  Dark
-                </Text>
-              </Pressable>
+                onPress={() =>
+                  setDraft((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          preferences: { ...prev.preferences, theme: "dark" },
+                        }
+                      : prev
+                  )
+                }
+              />
             </View>
 
             <PreferenceRow
-              label="Push notifications"
+              label="Push Notifications"
               value={draft.preferences.notifications}
               disabled={!isEditing}
               onChange={(value) =>
-                setDraft((prev) => ({
-                  ...prev,
-                  preferences: { ...prev.preferences, notifications: value },
-                }))
+                setDraft((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        preferences: { ...prev.preferences, notifications: value },
+                      }
+                    : prev
+                )
               }
             />
             <PreferenceRow
-              label="Show online status"
-              value={draft.preferences.showOnlineStatus}
+              label="Join With Microphone"
+              value={draft.preferences.audioDefault}
               disabled={!isEditing}
               onChange={(value) =>
-                setDraft((prev) => ({
-                  ...prev,
-                  preferences: { ...prev.preferences, showOnlineStatus: value },
-                }))
+                setDraft((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        preferences: { ...prev.preferences, audioDefault: value },
+                      }
+                    : prev
+                )
               }
             />
-          </View>
-
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>Subscription</Text>
-            <View style={styles.subscriptionRow}>
-              <Text style={styles.planName}>{draft.planName.toUpperCase()} PLAN</Text>
-              <Pressable
-                onPress={() => router.push("/(app)/billing")}
-                style={styles.inlineActionBtn}
-              >
-                <Text style={styles.inlineActionText}>Manage plan</Text>
-              </Pressable>
-            </View>
+            <PreferenceRow
+              label="Join With Camera"
+              value={draft.preferences.videoDefault}
+              disabled={!isEditing}
+              onChange={(value) =>
+                setDraft((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        preferences: { ...prev.preferences, videoDefault: value },
+                      }
+                    : prev
+                )
+              }
+            />
           </View>
 
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Actions</Text>
             {isEditing ? (
-              <View style={styles.actionRow}>
+              <View style={styles.rowButtons}>
                 <Pressable
-                  onPress={cancelEditing}
-                  style={[styles.actionBtn, styles.secondaryBtn]}
+                  style={[styles.ghostButton, styles.flexButton]}
+                  onPress={onCancelEdit}
                 >
-                  <Text style={styles.secondaryBtnText}>Cancel</Text>
+                  <Text style={styles.ghostButtonText}>Cancel</Text>
                 </Pressable>
                 <Pressable
-                  onPress={saveProfile}
                   style={[
-                    styles.actionBtn,
-                    styles.primaryBtn,
-                    (!hasChanges || isSaving) && styles.disabledBtn,
+                    styles.primaryButton,
+                    styles.flexButton,
+                    (!hasChanges || isBusy) && styles.buttonDisabled,
                   ]}
-                  disabled={!hasChanges || isSaving}
+                  onPress={onSaveProfile}
+                  disabled={!hasChanges || isBusy}
                 >
-                  <Text style={styles.primaryBtnText}>
-                    {isSaving ? "Saving..." : "Save"}
-                  </Text>
+                  <Text style={styles.primaryButtonText}>Save Changes</Text>
                 </Pressable>
               </View>
             ) : (
-              <View style={styles.actionRow}>
+              <View style={styles.rowButtons}>
                 <Pressable
+                  style={[styles.primaryButton, styles.flexButton]}
                   onPress={() => setIsEditing(true)}
-                  style={[styles.actionBtn, styles.primaryBtn]}
                 >
-                  <Text style={styles.primaryBtnText}>Edit Profile</Text>
+                  <Text style={styles.primaryButtonText}>Edit Profile</Text>
                 </Pressable>
-                <Pressable onPress={resetChanges} style={[styles.actionBtn, styles.secondaryBtn]}>
-                  <Text style={styles.secondaryBtnText}>Refresh</Text>
+                <Pressable
+                  style={[styles.ghostButton, styles.flexButton]}
+                  onPress={() => loadProfile(true)}
+                >
+                  <Text style={styles.ghostButtonText}>Refresh</Text>
                 </Pressable>
               </View>
             )}
 
-            <Pressable onPress={logout} style={styles.logoutBtn}>
-              <Text style={styles.logoutText}>Log out</Text>
+            <Pressable style={styles.logoutButton} onPress={onLogout}>
+              <Text style={styles.logoutButtonText}>Log Out</Text>
             </Pressable>
           </View>
         </ScrollView>
@@ -361,8 +566,8 @@ function PreferenceRow({
 }: {
   label: string;
   value: boolean;
-  disabled?: boolean;
-  onChange: (value: boolean) => void;
+  disabled: boolean;
+  onChange: (next: boolean) => void;
 }) {
   return (
     <View style={styles.preferenceRow}>
@@ -371,10 +576,39 @@ function PreferenceRow({
         value={value}
         onValueChange={onChange}
         disabled={disabled}
+        accessibilityLabel={label}
         trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
         thumbColor={value ? colors.primary : "#EEF3F8"}
       />
     </View>
+  );
+}
+
+function ThemeButton({
+  label,
+  selected,
+  disabled,
+  onPress,
+}: {
+  label: string;
+  selected: boolean;
+  disabled: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      style={[
+        styles.segment,
+        selected && styles.segmentActive,
+        disabled && styles.segmentDisabled,
+      ]}
+      onPress={onPress}
+      disabled={disabled}
+      accessibilityRole="button"
+      accessibilityState={{ selected, disabled }}
+    >
+      <Text style={[styles.segmentText, selected && styles.segmentTextActive]}>{label}</Text>
+    </Pressable>
   );
 }
 
@@ -389,71 +623,102 @@ const styles = StyleSheet.create({
   content: {
     paddingHorizontal: 16,
     paddingTop: 12,
-    paddingBottom: 94,
-    gap: 10,
+    paddingBottom: 96,
+    gap: 12,
+  },
+  contentCompact: {
+    paddingHorizontal: 12,
   },
   bgOrbTop: {
+    position: "absolute",
+    width: 320,
+    height: 320,
+    borderRadius: 160,
+    backgroundColor: "#E7F2FF",
+    top: -110,
+    right: -130,
+  },
+  bgOrbBottom: {
     position: "absolute",
     width: 280,
     height: 280,
     borderRadius: 140,
-    backgroundColor: "#D7E9FB",
-    top: -110,
-    right: -90,
+    backgroundColor: "#FFF2D8",
+    bottom: -130,
+    left: -100,
   },
-  bgOrbBottom: {
-    position: "absolute",
-    width: 260,
-    height: 260,
-    borderRadius: 130,
-    backgroundColor: "#FFECCB",
-    bottom: -120,
-    left: -90,
+  centeredState: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    paddingHorizontal: 20,
+  },
+  stateText: {
+    color: colors.textMuted,
+    fontFamily: type.body,
+    fontSize: 14,
+    textAlign: "center",
+  },
+  retryButton: {
+    borderWidth: 1,
+    borderColor: colors.primaryDark,
+    backgroundColor: colors.primary,
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  retryButtonText: {
+    color: colors.primaryText,
+    fontFamily: type.body,
+    fontSize: 14,
+    fontWeight: "700",
   },
   header: {
-    marginBottom: 4,
+    marginBottom: 2,
   },
   kicker: {
     color: colors.info,
     fontFamily: type.body,
     fontSize: 12,
     fontWeight: "800",
-    letterSpacing: 0.8,
+    letterSpacing: 0.9,
     textTransform: "uppercase",
   },
   title: {
     color: colors.text,
     fontFamily: type.display,
-    fontSize: 30,
-    lineHeight: 36,
-    marginTop: 3,
+    fontSize: 32,
+    lineHeight: 38,
+    marginTop: 2,
   },
   subtitle: {
     color: colors.textMuted,
     fontFamily: type.body,
     fontSize: 14,
-    marginTop: 2,
+    marginTop: 3,
   },
-  card: {
+  heroCard: {
+    position: "relative",
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.stroke,
-    borderRadius: 16,
-    padding: 12,
-    gap: 8,
+    borderRadius: 18,
+    padding: 14,
+    gap: 12,
   },
-  profileRow: {
+  heroTopRow: {
     flexDirection: "row",
-    gap: 10,
+    gap: 12,
     alignItems: "center",
   },
   avatarShell: {
-    width: 66,
-    height: 66,
-    borderRadius: 33,
-    backgroundColor: "#D3E7F8",
+    width: 78,
+    height: 78,
+    borderRadius: 39,
     borderWidth: 1,
     borderColor: colors.stroke,
+    backgroundColor: "#D8EAFB",
     alignItems: "center",
     justifyContent: "center",
     overflow: "hidden",
@@ -465,77 +730,65 @@ const styles = StyleSheet.create({
   avatarInitials: {
     color: colors.text,
     fontFamily: type.body,
-    fontSize: 22,
+    fontSize: 24,
     fontWeight: "800",
   },
-  profileMeta: {
+  heroTextWrap: {
     flex: 1,
-    gap: 6,
+    gap: 4,
   },
-  name: {
+  heroName: {
     color: colors.text,
     fontFamily: type.body,
-    fontSize: 18,
+    fontSize: 20,
     fontWeight: "800",
   },
-  badgeRow: {
-    flexDirection: "row",
-    gap: 6,
-    alignItems: "center",
-    flexWrap: "wrap",
-  },
-  roleBadge: {
-    backgroundColor: colors.surfaceSoft,
-    borderWidth: 1,
-    borderColor: colors.stroke,
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  roleBadgeText: {
+  heroMeta: {
     color: colors.textMuted,
     fontFamily: type.body,
-    fontSize: 11,
-    fontWeight: "700",
+    fontSize: 12,
   },
-  verifiedBadge: {
-    backgroundColor: "#FFEBC9",
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  verifiedText: {
-    color: colors.primaryDark,
-    fontFamily: type.body,
-    fontSize: 11,
-    fontWeight: "700",
-  },
-  inlineActions: {
+  avatarActions: {
     flexDirection: "row",
     gap: 8,
-    marginTop: 2,
+    flexWrap: "wrap",
   },
-  inlineActionBtn: {
-    borderRadius: 10,
+  avatarActionsCompact: {
+    flexDirection: "column",
+  },
+  avatarActionButton: {
+    minWidth: 130,
+  },
+  errorBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#F3A3A3",
+    backgroundColor: "#FFE5E5",
+  },
+  errorBannerText: {
+    flex: 1,
+    color: colors.error,
+    fontFamily: type.body,
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  card: {
+    backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.stroke,
-    backgroundColor: colors.surfaceSoft,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-  },
-  editCtaBtn: {
-    borderColor: colors.primaryDark,
-  },
-  inlineActionText: {
-    color: colors.text,
-    fontFamily: type.body,
-    fontSize: 12,
-    fontWeight: "700",
+    borderRadius: 18,
+    padding: 14,
+    gap: 10,
   },
   sectionTitle: {
     color: colors.text,
     fontFamily: type.body,
-    fontSize: 15,
+    fontSize: 16,
     fontWeight: "800",
   },
   fieldLabel: {
@@ -545,38 +798,38 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     letterSpacing: 0.6,
     textTransform: "uppercase",
-    marginTop: 2,
+    marginTop: 3,
   },
   input: {
     borderWidth: 1,
     borderColor: colors.stroke,
-    borderRadius: 10,
+    borderRadius: 12,
     backgroundColor: colors.surfaceSoft,
-    paddingHorizontal: 10,
-    paddingVertical: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
     color: colors.text,
     fontFamily: type.body,
     fontSize: 14,
   },
-  inputDisabled: {
-    opacity: 0.65,
-  },
-  textArea: {
-    minHeight: 74,
-    textAlignVertical: "top",
-  },
   readOnlyField: {
     borderWidth: 1,
     borderColor: colors.stroke,
-    borderRadius: 10,
+    borderRadius: 12,
     backgroundColor: "#F0F4F8",
-    paddingHorizontal: 10,
-    paddingVertical: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
   },
   readOnlyText: {
     color: colors.textMuted,
     fontFamily: type.body,
     fontSize: 14,
+  },
+  textArea: {
+    minHeight: 94,
+    textAlignVertical: "top",
+  },
+  inputDisabled: {
+    opacity: 0.7,
   },
   preferenceRow: {
     flexDirection: "row",
@@ -589,27 +842,30 @@ const styles = StyleSheet.create({
     fontFamily: type.body,
     fontSize: 14,
     fontWeight: "600",
+    flex: 1,
+    paddingRight: 8,
   },
   segmentRow: {
     flexDirection: "row",
     gap: 8,
-    marginBottom: 2,
+    marginBottom: 4,
   },
   segment: {
     flex: 1,
     borderWidth: 1,
     borderColor: colors.stroke,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: "center",
-    paddingVertical: 8,
+    justifyContent: "center",
+    paddingVertical: 10,
     backgroundColor: colors.surfaceSoft,
-  },
-  segmentDisabled: {
-    opacity: 0.6,
   },
   segmentActive: {
     backgroundColor: colors.primary,
     borderColor: colors.primaryDark,
+  },
+  segmentDisabled: {
+    opacity: 0.55,
   },
   segmentText: {
     color: colors.textMuted,
@@ -620,72 +876,82 @@ const styles = StyleSheet.create({
   segmentTextActive: {
     color: colors.primaryText,
   },
-  subscriptionRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: 8,
-    flexWrap: "wrap",
-  },
-  planName: {
-    color: colors.primaryDark,
-    fontFamily: type.body,
-    fontSize: 13,
-    fontWeight: "800",
-    letterSpacing: 0.5,
-  },
-  actionRow: {
+  rowButtons: {
     flexDirection: "row",
     gap: 8,
   },
-  actionBtn: {
+  flexButton: {
     flex: 1,
-    borderRadius: 10,
-    paddingVertical: 11,
-    alignItems: "center",
   },
-  primaryBtn: {
+  primaryButton: {
+    borderRadius: 12,
     backgroundColor: colors.primary,
     borderWidth: 1,
     borderColor: colors.primaryDark,
+    paddingVertical: 11,
+    alignItems: "center",
   },
-  primaryBtnText: {
+  primaryButtonText: {
     color: colors.primaryText,
     fontFamily: type.body,
     fontSize: 14,
     fontWeight: "700",
   },
-  secondaryBtn: {
+  ghostButton: {
+    borderRadius: 12,
     backgroundColor: colors.surfaceSoft,
     borderWidth: 1,
     borderColor: colors.stroke,
+    paddingVertical: 11,
+    paddingHorizontal: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+    gap: 6,
   },
-  secondaryBtnText: {
+  ghostButtonText: {
     color: colors.text,
     fontFamily: type.body,
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: "700",
   },
-  disabledBtn: {
-    opacity: 0.55,
+  dangerButton: {
+    borderRadius: 12,
+    backgroundColor: "#FFEDEE",
+    borderWidth: 1,
+    borderColor: "#F3A3A3",
+    paddingVertical: 11,
+    paddingHorizontal: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+    gap: 6,
   },
-  disabledText: {
-    opacity: 0.45,
+  dangerButtonText: {
+    color: colors.error,
+    fontFamily: type.body,
+    fontSize: 13,
+    fontWeight: "700",
   },
-  logoutBtn: {
-    marginTop: 6,
+  buttonDisabled: {
+    opacity: 0.6,
+  },
+  logoutButton: {
+    marginTop: 4,
+    borderRadius: 12,
     backgroundColor: "#FFE5E5",
     borderWidth: 1,
     borderColor: "#F3A3A3",
-    borderRadius: 10,
     paddingVertical: 11,
     alignItems: "center",
   },
-  logoutText: {
-    color: "#DC0000",
+  logoutButtonText: {
+    color: colors.error,
     fontFamily: type.body,
     fontSize: 14,
     fontWeight: "700",
   },
+  disabledText: {
+    opacity: 0.6,
+  },
 });
-

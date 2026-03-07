@@ -1,5 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useMemo, useState, useEffect } from "react";
+import { useLocalSearchParams } from "expo-router";
 import * as FileSystem from "expo-file-system/legacy";
 import * as MediaLibrary from "expo-media-library";
 import {
@@ -57,6 +58,10 @@ function makeRoomId() {
 }
 
 export default function CallRoomScreen() {
+  const { meetingId, title } = useLocalSearchParams<{
+    meetingId?: string | string[];
+    title?: string | string[];
+  }>();
   const { width } = useWindowDimensions();
   const [phase, setPhase] = useState<"lobby" | "inCall">("lobby");
 
@@ -93,6 +98,15 @@ export default function CallRoomScreen() {
   });
   const [lastRecordingPath, setLastRecordingPath] = useState<string | null>(null);
 
+  const sharedMeetingId = useMemo(
+    () => (Array.isArray(meetingId) ? meetingId[0] : meetingId),
+    [meetingId]
+  );
+  const sharedTitle = useMemo(
+    () => (Array.isArray(title) ? title[0] : title),
+    [title]
+  );
+
   const activeRemotePool = useMemo(
     () =>
       remoteParticipantPool.filter(
@@ -124,6 +138,15 @@ export default function CallRoomScreen() {
       socketManager.disconnect();
     };
   }, [localStream, screenShareStream]);
+
+  useEffect(() => {
+    if (sharedMeetingId?.trim()) {
+      setJoinRoomId(sharedMeetingId.trim().toLowerCase());
+    }
+    if (sharedTitle?.trim()) {
+      setCallTitle(sharedTitle.trim());
+    }
+  }, [sharedMeetingId, sharedTitle]);
 
   useEffect(() => {
     if (phase !== "inCall") return;
@@ -587,6 +610,11 @@ export default function CallRoomScreen() {
             <Text style={styles.heroSub}>
               Simulation mode with adaptive tile layout, call controls, and meeting chat.
             </Text>
+            {sharedMeetingId ? (
+              <Text style={styles.deepLinkHint}>
+                Invite link detected for meeting: {sharedMeetingId}
+              </Text>
+            ) : null}
           </View>
 
           <View style={styles.panel}>
@@ -1108,6 +1136,13 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     fontFamily: type.body,
     fontSize: 13,
+  },
+  deepLinkHint: {
+    marginTop: 4,
+    color: colors.info,
+    fontFamily: type.body,
+    fontSize: 12,
+    fontWeight: "700",
   },
   panel: {
     backgroundColor: colors.surface,

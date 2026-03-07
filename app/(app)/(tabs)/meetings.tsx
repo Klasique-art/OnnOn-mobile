@@ -1,125 +1,191 @@
-import { useMemo, useState } from "react";
-import DateTimePicker from "@react-native-community/datetimepicker";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "expo-router";
+import { AxiosError } from "axios";
+import * as Linking from "expo-linking";
 import {
+  ActivityIndicator,
   FlatList,
   Modal,
-  Platform,
   Pressable,
+  RefreshControl,
+  ScrollView,
+  Share,
   StyleSheet,
   Switch,
   Text,
   TextInput,
   View,
 } from "react-native";
-import { colors, type } from "@/src/theme/colors";
-import { MockMeeting, mockMeetings } from "@/src/data/mockMeetings";
 
+import client from "@/lib/client";
+import AppPopup, { PopupAction, PopupTone } from "@/src/components/AppPopup";
+import { colors, type } from "@/src/theme/colors";
+
+type MeetingStatus = "live" | "scheduled" | "completed";
 type Filter = "all" | "live" | "scheduled";
 
+type MeetingItem = {
+  id: string;
+  title: string;
+  hostName: string;
+  isHost?: boolean;
+  startsAt: string;
+  durationMinutes: number;
+  participantCount: number;
+  maxParticipants: number;
+  passwordProtected: boolean;
+  status: MeetingStatus;
+  settings?: {
+    waitingRoom?: boolean;
+    muteOnJoin?: boolean;
+    allowScreenShare?: boolean;
+    allowRecording?: boolean;
+  };
+};
+
+type Pagination = {
+  page: number;
+  limit: number;
+  totalItems: number;
+  totalPages: number;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
+};
+
+type MeetingsResponse = {
+  success: boolean;
+  message?: string;
+  data: {
+    items: MeetingItem[];
+    pagination: Pagination;
+    serverTime?: string;
+  };
+};
+
+type ApiErrorResponse = {
+  success?: boolean;
+  message?: string;
+};
+
+const PAGE_LIMIT = 20;
+const APP_LINK_BASE_URL = "https://onnon.app";
+
 export default function MeetingsScreen() {
-  const [meetings, setMeetings] = useState<MockMeeting[]>(mockMeetings);
+  const router = useRouter();
+  const [meetings, setMeetings] = useState<MeetingItem[]>([]);
   const [filter, setFilter] = useState<Filter>("all");
-  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [viewerDisplayName, setViewerDisplayName] = useState<string>("");
+  const [pagination, setPagination] = useState<Pagination | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [screenError, setScreenError] = useState<string | null>(null);
+  const [isEditOpen, setIsEditOpen] = useState(false);
+  const [isSavingEdit, setIsSavingEdit] = useState(false);
+  const [editingMeeting, setEditingMeeting] = useState<MeetingItem | null>(null);
+  const [editTitle, setEditTitle] = useState("");
+  const [editPassword, setEditPassword] = useState("");
+  const [editWaitingRoom, setEditWaitingRoom] = useState(false);
+  const [editMuteOnJoin, setEditMuteOnJoin] = useState(true);
+  const [editAllowScreenShare, setEditAllowScreenShare] = useState(true);
+  const [editAllowRecording, setEditAllowRecording] = useState(false);
+  const [popupTitle, setPopupTitle] = useState("");
+  const [popupMessage, setPopupMessage] = useState("");
+  const [popupTone, setPopupTone] = useState<PopupTone>("info");
+  const [popupActions, setPopupActions] = useState<PopupAction[]>([
+    { label: "OK", variant: "primary" },
+  ]);
+  const [isPopupVisible, setIsPopupVisible] = useState(false);
 
-  const [title, setTitle] = useState("");
-  const [hostName, setHostName] = useState("You");
-  const [scheduleMode, setScheduleMode] = useState<"instant" | "scheduled">(
-    "instant"
+  const fetchMeetings = useCallback(
+    async (page: number, mode: "initial" | "refresh" | "loadMore") => {
+      try {
+        if (mode === "initial") setIsLoading(true);
+        if (mode === "refresh") setIsRefreshing(true);
+        if (mode === "loadMore") setIsLoadingMore(true);
+        setScreenError(null);
+
+        const params: Record<string, string | number> = {
+          page,
+          limit: PAGE_LIMIT,
+        };
+        if (filter !== "all") {
+          params.status = filter;
+        }
+
+        const response = await client.get<MeetingsResponse>("/meetings", { params });
+        const payload = response.data.data;
+        const nextItems = payload?.items ?? [];
+
+        setMeetings((prev) => (page === 1 ? nextItems : [...prev, ...nextItems]));
+        setPagination(payload?.pagination ?? null);
+      } catch (err) {
+        const apiError = err as AxiosError<ApiErrorResponse>;
+        console.error("[Meetings] Failed to fetch meetings", {
+          message: apiError?.message || String(err),
+          code: apiError?.code,
+          status: apiError?.response?.status,
+          responseData: apiError?.response?.data,
+          filter,
+          page,
+        });
+        setScreenError(
+          apiError?.response?.data?.message || "Could not load meetings."
+        );
+      } finally {
+        if (mode === "initial") setIsLoading(false);
+        if (mode === "refresh") setIsRefreshing(false);
+        if (mode === "loadMore") setIsLoadingMore(false);
+      }
+    },
+    [filter]
   );
-  const [durationMinutes, setDurationMinutes] = useState(30);
-  const [maxParticipants, setMaxParticipants] = useState(25);
-  const [passwordProtected, setPasswordProtected] = useState(false);
-  const [startsAt, setStartsAt] = useState(new Date(Date.now() + 30 * 60 * 1000));
-  const [showPicker, setShowPicker] = useState(false);
 
-  const visibleMeetings = useMemo(() => {
-    const base =
-      filter === "all"
-        ? meetings
-        : meetings.filter((meeting) => meeting.status === filter);
+  useEffect(() => {
+    fetchMeetings(1, "initial");
+  }, [fetchMeetings]);
 
-    return [...base].sort(
-      (a, b) => new Date(a.startsAt).getTime() - new Date(b.startsAt).getTime()
-    );
-  }, [meetings, filter]);
+  useEffect(() => {
+    const loadViewerProfile = async () => {
+      try {
+        const response = await client.get<{ success: boolean; data: { displayName: string } }>(
+          "/profile/me"
+        );
+        setViewerDisplayName(response.data?.data?.displayName || "");
+      } catch (err) {
+        const apiError = err as AxiosError<ApiErrorResponse>;
+        console.error("[Meetings] Failed to resolve viewer profile", {
+          message: apiError?.message || String(err),
+          code: apiError?.code,
+          status: apiError?.response?.status,
+          responseData: apiError?.response?.data,
+        });
+      }
+    };
+
+    loadViewerProfile();
+  }, []);
+
+  const onRefresh = () => fetchMeetings(1, "refresh");
+
+  const onEndReached = () => {
+    if (isLoading || isRefreshing || isLoadingMore) return;
+    if (!pagination?.hasNextPage) return;
+    fetchMeetings(pagination.page + 1, "loadMore");
+  };
 
   const stats = useMemo(() => {
     return {
-      total: meetings.length,
+      total: pagination?.totalItems ?? meetings.length,
       live: meetings.filter((meeting) => meeting.status === "live").length,
-      scheduled: meetings.filter((meeting) => meeting.status === "scheduled")
-        .length,
+      scheduled: meetings.filter((meeting) => meeting.status === "scheduled").length,
     };
-  }, [meetings]);
+  }, [meetings, pagination?.totalItems]);
 
-  const resetCreateState = () => {
-    setTitle("");
-    setHostName("You");
-    setScheduleMode("instant");
-    setDurationMinutes(30);
-    setMaxParticipants(25);
-    setPasswordProtected(false);
-    setStartsAt(new Date(Date.now() + 30 * 60 * 1000));
-  };
-
-  const createMeeting = () => {
-    const cleanTitle = title.trim();
-    if (!cleanTitle) return;
-
-    const now = new Date();
-    const isInstant = scheduleMode === "instant";
-    const newMeeting: MockMeeting = {
-      id: `mtg-${Date.now()}`,
-      title: cleanTitle,
-      hostName: hostName.trim() || "You",
-      startsAt: isInstant ? now.toISOString() : startsAt.toISOString(),
-      durationMinutes,
-      participantCount: isInstant ? 1 : 0,
-      maxParticipants,
-      passwordProtected,
-      status: isInstant ? "live" : "scheduled",
-    };
-
-    setMeetings((prev) => [newMeeting, ...prev]);
-    setIsCreateOpen(false);
-    resetCreateState();
-  };
-
-  const joinMeeting = (meetingId: string) => {
-    setMeetings((prev) =>
-      prev.map((meeting) => {
-        if (meeting.id !== meetingId) return meeting;
-        const nextCount = Math.min(
-          meeting.participantCount + 1,
-          meeting.maxParticipants
-        );
-        return { ...meeting, participantCount: nextCount };
-      })
-    );
-  };
-
-  const startMeeting = (meetingId: string) => {
-    setMeetings((prev) =>
-      prev.map((meeting) =>
-        meeting.id === meetingId
-          ? {
-              ...meeting,
-              status: "live",
-              startsAt: new Date().toISOString(),
-              participantCount: Math.max(meeting.participantCount, 1),
-            }
-          : meeting
-      )
-    );
-  };
-
-  const endMeeting = (meetingId: string) => {
-    setMeetings((prev) =>
-      prev.map((meeting) =>
-        meeting.id === meetingId ? { ...meeting, status: "completed" } : meeting
-      )
-    );
-  };
+  const visibleMeetings = useMemo(() => {
+    if (filter === "all") return meetings;
+    return meetings.filter((meeting) => meeting.status === filter);
+  }, [filter, meetings]);
 
   const formatTime = (iso: string) =>
     new Date(iso).toLocaleString([], {
@@ -147,6 +213,180 @@ export default function MeetingsScreen() {
     </Pressable>
   );
 
+  const isMeetingHost = (meeting: MeetingItem) => {
+    if (typeof meeting.isHost === "boolean") return meeting.isHost;
+    const host = meeting.hostName?.trim().toLowerCase();
+    const viewer = viewerDisplayName.trim().toLowerCase();
+    return Boolean(host && viewer && host === viewer);
+  };
+
+  const onJoinMeeting = (meeting: MeetingItem) => {
+    router.push({
+      pathname: "/(app)/call-room",
+      params: { meetingId: meeting.id, title: meeting.title },
+    });
+  };
+
+  const onShareScheduledMeeting = async (meeting: MeetingItem) => {
+    const deepLink = Linking.createURL(`/meeting/${meeting.id}`, {
+      queryParams: { title: meeting.title },
+    });
+    const universalLink = `${APP_LINK_BASE_URL}/meeting/${encodeURIComponent(
+      meeting.id
+    )}?title=${encodeURIComponent(meeting.title)}`;
+
+    try {
+      await Share.share({
+        title: "Share Meeting",
+        message: `Join my OnnOn meeting: ${meeting.title}\nMeeting ID: ${meeting.id}\nOpen: ${universalLink}\nApp link: ${deepLink}`,
+        url: universalLink,
+      });
+    } catch (err) {
+      const apiError = err as Error;
+      console.error("[Meetings] Failed to share meeting link", {
+        message: apiError?.message || String(err),
+        meetingId: meeting.id,
+        universalLink,
+        deepLink,
+      });
+      showPopup({
+        title: "Share Failed",
+        message: "Could not open share sheet for this meeting.",
+        tone: "danger",
+      });
+    }
+  };
+
+  const showPopup = ({
+    title,
+    message,
+    tone = "info",
+    actions = [{ label: "OK", variant: "primary" }],
+  }: {
+    title: string;
+    message?: string;
+    tone?: PopupTone;
+    actions?: PopupAction[];
+  }) => {
+    setPopupTitle(title);
+    setPopupMessage(message || "");
+    setPopupTone(tone);
+    setPopupActions(actions);
+    setIsPopupVisible(true);
+  };
+
+  const closePopup = () => {
+    setIsPopupVisible(false);
+  };
+
+  const onEndMeeting = (meeting: MeetingItem) => {
+    showPopup({
+      title: "End Meeting",
+      message: `End "${meeting.title}" for all participants?`,
+      tone: "danger",
+      actions: [
+        {
+          label: "Cancel",
+          variant: "secondary",
+        },
+        {
+          label: "End",
+          variant: "danger",
+          onPress: () => {
+            // Local UI update until dedicated end-meeting endpoint is connected.
+            setMeetings((prev) => prev.filter((item) => item.id !== meeting.id));
+          },
+        },
+      ],
+    });
+  };
+
+  const openEditMeeting = (meeting: MeetingItem) => {
+    setEditingMeeting(meeting);
+    setEditTitle(meeting.title || "");
+    setEditPassword(meeting.passwordProtected ? "" : "");
+    setEditWaitingRoom(Boolean(meeting.settings?.waitingRoom));
+    setEditMuteOnJoin(meeting.settings?.muteOnJoin ?? true);
+    setEditAllowScreenShare(meeting.settings?.allowScreenShare ?? true);
+    setEditAllowRecording(Boolean(meeting.settings?.allowRecording));
+    setIsEditOpen(true);
+  };
+
+  const closeEditMeeting = () => {
+    if (isSavingEdit) return;
+    setIsEditOpen(false);
+    setEditingMeeting(null);
+    setEditTitle("");
+    setEditPassword("");
+  };
+
+  const submitEditMeeting = async () => {
+    if (!editingMeeting) return;
+    const trimmedTitle = editTitle.trim();
+    if (!trimmedTitle) {
+      showPopup({
+        title: "Validation",
+        message: "Meeting title is required.",
+        tone: "danger",
+      });
+      return;
+    }
+
+    try {
+      setIsSavingEdit(true);
+      await client.put(`/meetings/${editingMeeting.id}`, {
+        title: trimmedTitle,
+        password: editPassword,
+        settings: {
+          waitingRoom: editWaitingRoom,
+          muteOnJoin: editMuteOnJoin,
+          allowScreenShare: editAllowScreenShare,
+          allowRecording: editAllowRecording,
+        },
+      });
+
+      setMeetings((prev) =>
+        prev.map((meeting) =>
+          meeting.id === editingMeeting.id
+            ? {
+                ...meeting,
+                title: trimmedTitle,
+                passwordProtected: editPassword.trim().length > 0,
+                settings: {
+                  waitingRoom: editWaitingRoom,
+                  muteOnJoin: editMuteOnJoin,
+                  allowScreenShare: editAllowScreenShare,
+                  allowRecording: editAllowRecording,
+                },
+              }
+            : meeting
+        )
+      );
+      closeEditMeeting();
+      showPopup({
+        title: "Meeting Updated",
+        message: "Scheduled meeting settings were updated.",
+        tone: "success",
+      });
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      console.error("[Meetings] Failed to edit meeting", {
+        message: apiError?.message || String(err),
+        code: apiError?.code,
+        status: apiError?.response?.status,
+        responseData: apiError?.response?.data,
+        meetingId: editingMeeting.id,
+      });
+      showPopup({
+        title: "Update Failed",
+        message: apiError?.response?.data?.message || "Could not update meeting.",
+        tone: "danger",
+      });
+    } finally {
+      setIsSavingEdit(false);
+    }
+  };
+
   return (
     <View style={styles.screen}>
       <View style={styles.bgOrbTop} />
@@ -155,9 +395,7 @@ export default function MeetingsScreen() {
       <View style={styles.header}>
         <Text style={styles.kicker}>Meetings</Text>
         <Text style={styles.title}>Plan, start, and manage sessions</Text>
-        <Text style={styles.subtitle}>
-          Local simulation mode: no backend calls yet.
-        </Text>
+        <Text style={styles.subtitle}>Synced with backend meetings API.</Text>
       </View>
 
       <View style={styles.statsRow}>
@@ -181,249 +419,235 @@ export default function MeetingsScreen() {
         {renderFilter("scheduled", "Scheduled")}
       </View>
 
-      <FlatList
-        data={visibleMeetings}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.listContent}
-        ListEmptyComponent={
-          <View style={styles.emptyCard}>
-            <Text style={styles.emptyTitle}>No meetings yet</Text>
-            <Text style={styles.emptyText}>
-              Create your first instant or scheduled meeting.
-            </Text>
-          </View>
-        }
-        renderItem={({ item }) => {
-          const isLive = item.status === "live";
-          const isScheduled = item.status === "scheduled";
-          const isCompleted = item.status === "completed";
-          return (
-            <View style={styles.meetingCard}>
-              <View style={styles.meetingTopRow}>
-                <Text style={styles.meetingTitle}>{item.title}</Text>
-                <View
-                  style={[
-                    styles.statusBadge,
-                    isLive && styles.statusLive,
-                    isScheduled && styles.statusScheduled,
-                    isCompleted && styles.statusCompleted,
-                  ]}
-                >
-                  <Text style={styles.statusText}>{item.status}</Text>
+      {screenError ? (
+        <View style={styles.errorBanner}>
+          <Text style={styles.errorBannerText}>{screenError}</Text>
+        </View>
+      ) : null}
+
+      {isLoading ? (
+        <View style={styles.loadingWrap}>
+          <ActivityIndicator size="large" color={colors.primaryDark} />
+          <Text style={styles.loadingText}>Loading meetings...</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={visibleMeetings}
+          keyExtractor={(item) => item.id}
+          contentContainerStyle={styles.listContent}
+          onEndReachedThreshold={0.3}
+          onEndReached={onEndReached}
+          refreshControl={
+            <RefreshControl
+              refreshing={isRefreshing}
+              onRefresh={onRefresh}
+              tintColor={colors.primaryDark}
+            />
+          }
+          ListEmptyComponent={
+            <View style={styles.emptyCard}>
+              <Text style={styles.emptyTitle}>No meetings found</Text>
+              <Text style={styles.emptyText}>
+                There are no meetings for this filter right now.
+              </Text>
+            </View>
+          }
+          ListFooterComponent={
+            isLoadingMore ? (
+              <View style={styles.footerLoader}>
+                <ActivityIndicator size="small" color={colors.primaryDark} />
+                <Text style={styles.footerLoaderText}>Loading more...</Text>
+              </View>
+            ) : null
+          }
+          renderItem={({ item }) => {
+            const isLive = item.status === "live";
+            const isScheduled = item.status === "scheduled";
+            const isCompleted = item.status === "completed";
+            const isHost = isMeetingHost(item);
+
+            return (
+              <View style={styles.meetingCard}>
+                <View style={styles.meetingTopRow}>
+                  <Text style={styles.meetingTitle}>{item.title}</Text>
+                  <View
+                    style={[
+                      styles.statusBadge,
+                      isLive && styles.statusLive,
+                      isScheduled && styles.statusScheduled,
+                      isCompleted && styles.statusCompleted,
+                    ]}
+                  >
+                    <Text style={styles.statusText}>{item.status}</Text>
+                  </View>
+                </View>
+                <Text style={styles.metaText}>Host: {item.hostName}</Text>
+                <Text style={styles.metaText}>Starts: {formatTime(item.startsAt)}</Text>
+                <Text style={styles.metaText}>
+                  {item.participantCount}/{item.maxParticipants} participants |{" "}
+                  {item.durationMinutes} mins
+                </Text>
+                <Text style={styles.metaText}>
+                  {item.passwordProtected ? "Password protected" : "No password"}
+                </Text>
+
+                <View style={styles.actionRow}>
+                  {isLive ? (
+                    <Pressable
+                      onPress={() => onJoinMeeting(item)}
+                      style={styles.actionPrimary}
+                    >
+                      <Text style={styles.actionPrimaryText}>Join</Text>
+                    </Pressable>
+                  ) : null}
+
+                  {isScheduled ? (
+                    <Pressable
+                      onPress={() => void onShareScheduledMeeting(item)}
+                      style={styles.actionSecondary}
+                    >
+                      <Text style={styles.actionSecondaryText}>Share</Text>
+                    </Pressable>
+                  ) : null}
+
+                  {isLive && isHost ? (
+                    <Pressable
+                      onPress={() => onEndMeeting(item)}
+                      style={styles.actionSecondary}
+                    >
+                      <Text style={styles.actionSecondaryText}>End</Text>
+                    </Pressable>
+                  ) : null}
+
+                  {isScheduled && isHost ? (
+                    <Pressable
+                      onPress={() => openEditMeeting(item)}
+                      style={styles.actionSecondary}
+                    >
+                      <Text style={styles.actionSecondaryText}>Edit</Text>
+                    </Pressable>
+                  ) : null}
+
+                  {isScheduled && !isHost ? (
+                    <Pressable style={styles.actionDisabled} disabled>
+                      <Text style={styles.actionDisabledText}>Scheduled</Text>
+                    </Pressable>
+                  ) : null}
                 </View>
               </View>
-              <Text style={styles.metaText}>Host: {item.hostName}</Text>
-              <Text style={styles.metaText}>Starts: {formatTime(item.startsAt)}</Text>
-              <Text style={styles.metaText}>
-                {item.participantCount}/{item.maxParticipants} participants |{" "}
-                {item.durationMinutes} mins
-              </Text>
-              <Text style={styles.metaText}>
-                {item.passwordProtected ? "Password protected" : "No password"}
-              </Text>
-
-              <View style={styles.actionRow}>
-                {!isCompleted ? (
-                  <Pressable
-                    onPress={() => joinMeeting(item.id)}
-                    style={styles.actionPrimary}
-                  >
-                    <Text style={styles.actionPrimaryText}>Join</Text>
-                  </Pressable>
-                ) : null}
-
-                {isScheduled ? (
-                  <Pressable
-                    onPress={() => startMeeting(item.id)}
-                    style={styles.actionSecondary}
-                  >
-                    <Text style={styles.actionSecondaryText}>Start now</Text>
-                  </Pressable>
-                ) : null}
-
-                {isLive ? (
-                  <Pressable
-                    onPress={() => endMeeting(item.id)}
-                    style={styles.actionSecondary}
-                  >
-                    <Text style={styles.actionSecondaryText}>End</Text>
-                  </Pressable>
-                ) : null}
-              </View>
-            </View>
-          );
-        }}
-      />
-
-      <Pressable style={styles.fab} onPress={() => setIsCreateOpen(true)}>
-        <Text style={styles.fabText}>+ New Meeting</Text>
-      </Pressable>
+            );
+          }}
+        />
+      )}
 
       <Modal
-        visible={isCreateOpen}
+        visible={isEditOpen}
         animationType="slide"
         transparent
-        onRequestClose={() => setIsCreateOpen(false)}
+        onRequestClose={closeEditMeeting}
       >
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>Create Meeting</Text>
+            <ScrollView contentContainerStyle={styles.modalContent}>
+              <Text style={styles.modalTitle}>Edit Scheduled Meeting</Text>
+              <Text style={styles.modalHint}>
+                Leave password empty to remove password protection.
+              </Text>
 
-            <Text style={styles.fieldLabel}>Title</Text>
-            <TextInput
-              value={title}
-              onChangeText={setTitle}
-              placeholder="Enter meeting title"
-              placeholderTextColor={colors.textMuted}
-              style={styles.input}
-            />
-
-            <Text style={styles.fieldLabel}>Host name</Text>
-            <TextInput
-              value={hostName}
-              onChangeText={setHostName}
-              placeholder="Enter host name"
-              placeholderTextColor={colors.textMuted}
-              style={styles.input}
-            />
-
-            <Text style={styles.fieldLabel}>Type</Text>
-            <View style={styles.segmentRow}>
-              <Pressable
-                onPress={() => setScheduleMode("instant")}
-                style={[
-                  styles.segment,
-                  scheduleMode === "instant" && styles.segmentActive,
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.segmentText,
-                    scheduleMode === "instant" && styles.segmentTextActive,
-                  ]}
-                >
-                  Start now
-                </Text>
-              </Pressable>
-              <Pressable
-                onPress={() => setScheduleMode("scheduled")}
-                style={[
-                  styles.segment,
-                  scheduleMode === "scheduled" && styles.segmentActive,
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.segmentText,
-                    scheduleMode === "scheduled" && styles.segmentTextActive,
-                  ]}
-                >
-                  Schedule
-                </Text>
-              </Pressable>
-            </View>
-
-            {scheduleMode === "scheduled" ? (
-              <>
-                <Text style={styles.fieldLabel}>Starts at</Text>
-                <Pressable onPress={() => setShowPicker(true)} style={styles.input}>
-                  <Text style={styles.inputText}>{formatTime(startsAt.toISOString())}</Text>
-                </Pressable>
-              </>
-            ) : null}
-
-            <Text style={styles.fieldLabel}>Duration (minutes)</Text>
-            <View style={styles.optionRow}>
-              {[30, 45, 60].map((value) => (
-                <Pressable
-                  key={value}
-                  onPress={() => setDurationMinutes(value)}
-                  style={[
-                    styles.optionChip,
-                    durationMinutes === value && styles.optionChipActive,
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.optionChipText,
-                      durationMinutes === value && styles.optionChipTextActive,
-                    ]}
-                  >
-                    {value}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-
-            <Text style={styles.fieldLabel}>Max participants</Text>
-            <View style={styles.optionRow}>
-              {[5, 25, 100].map((value) => (
-                <Pressable
-                  key={value}
-                  onPress={() => setMaxParticipants(value)}
-                  style={[
-                    styles.optionChip,
-                    maxParticipants === value && styles.optionChipActive,
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.optionChipText,
-                      maxParticipants === value && styles.optionChipTextActive,
-                    ]}
-                  >
-                    {value}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-
-            <View style={styles.switchRow}>
-              <Text style={styles.switchLabel}>Password protected</Text>
-              <Switch
-                value={passwordProtected}
-                onValueChange={setPasswordProtected}
-                trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
-                thumbColor={passwordProtected ? colors.primary : "#EEF3F8"}
+              <Text style={styles.fieldLabel}>Title</Text>
+              <TextInput
+                style={styles.input}
+                value={editTitle}
+                onChangeText={setEditTitle}
+                placeholder="Meeting title"
+                placeholderTextColor={colors.textMuted}
+                editable={!isSavingEdit}
               />
-            </View>
 
-            <View style={styles.modalActions}>
-              <Pressable
-                onPress={() => {
-                  setIsCreateOpen(false);
-                  resetCreateState();
-                }}
-                style={styles.cancelButton}
-              >
-                <Text style={styles.cancelText}>Cancel</Text>
-              </Pressable>
-              <Pressable
-                onPress={createMeeting}
-                style={[
-                  styles.createButton,
-                  !title.trim() && styles.createButtonDisabled,
-                ]}
-                disabled={!title.trim()}
-              >
-                <Text style={styles.createText}>Create</Text>
-              </Pressable>
-            </View>
+              <Text style={styles.fieldLabel}>Password</Text>
+              <TextInput
+                style={styles.input}
+                value={editPassword}
+                onChangeText={setEditPassword}
+                placeholder="Set password or leave empty"
+                placeholderTextColor={colors.textMuted}
+                editable={!isSavingEdit}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+
+              <View style={styles.toggleRow}>
+                <Text style={styles.toggleLabel}>Waiting Room</Text>
+                <Switch
+                  value={editWaitingRoom}
+                  onValueChange={setEditWaitingRoom}
+                  disabled={isSavingEdit}
+                  trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
+                  thumbColor={editWaitingRoom ? colors.primary : "#EEF3F8"}
+                />
+              </View>
+              <View style={styles.toggleRow}>
+                <Text style={styles.toggleLabel}>Mute On Join</Text>
+                <Switch
+                  value={editMuteOnJoin}
+                  onValueChange={setEditMuteOnJoin}
+                  disabled={isSavingEdit}
+                  trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
+                  thumbColor={editMuteOnJoin ? colors.primary : "#EEF3F8"}
+                />
+              </View>
+              <View style={styles.toggleRow}>
+                <Text style={styles.toggleLabel}>Allow Screen Share</Text>
+                <Switch
+                  value={editAllowScreenShare}
+                  onValueChange={setEditAllowScreenShare}
+                  disabled={isSavingEdit}
+                  trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
+                  thumbColor={editAllowScreenShare ? colors.primary : "#EEF3F8"}
+                />
+              </View>
+              <View style={styles.toggleRow}>
+                <Text style={styles.toggleLabel}>Allow Recording</Text>
+                <Switch
+                  value={editAllowRecording}
+                  onValueChange={setEditAllowRecording}
+                  disabled={isSavingEdit}
+                  trackColor={{ false: "#B7C5D5", true: "#F6C063" }}
+                  thumbColor={editAllowRecording ? colors.primary : "#EEF3F8"}
+                />
+              </View>
+
+              <View style={styles.modalActions}>
+                <Pressable
+                  style={styles.modalCancelBtn}
+                  onPress={closeEditMeeting}
+                  disabled={isSavingEdit}
+                >
+                  <Text style={styles.modalCancelText}>Cancel</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.modalSaveBtn, isSavingEdit && styles.modalSaveBtnDisabled]}
+                  onPress={submitEditMeeting}
+                  disabled={isSavingEdit}
+                >
+                  <Text style={styles.modalSaveText}>
+                    {isSavingEdit ? "Saving..." : "Save"}
+                  </Text>
+                </Pressable>
+              </View>
+            </ScrollView>
           </View>
         </View>
       </Modal>
 
-      {showPicker ? (
-        <DateTimePicker
-          mode="datetime"
-          value={startsAt}
-          minimumDate={new Date()}
-          onChange={(_event, selectedDate) => {
-            if (Platform.OS !== "ios") setShowPicker(false);
-            if (selectedDate) setStartsAt(selectedDate);
-          }}
-        />
-      ) : null}
+      <AppPopup
+        visible={isPopupVisible}
+        title={popupTitle}
+        message={popupMessage}
+        tone={popupTone}
+        actions={popupActions}
+        onClose={closePopup}
+      />
     </View>
   );
 }
@@ -533,6 +757,32 @@ const styles = StyleSheet.create({
   filterChipTextActive: {
     color: colors.primaryText,
   },
+  errorBanner: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#F3A3A3",
+    backgroundColor: "#FFE5E5",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 10,
+  },
+  errorBannerText: {
+    color: colors.error,
+    fontFamily: type.body,
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  loadingWrap: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+  },
+  loadingText: {
+    color: colors.textMuted,
+    fontFamily: type.body,
+    fontSize: 14,
+  },
   listContent: {
     paddingBottom: 120,
     gap: 10,
@@ -640,28 +890,31 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "700",
   },
-  fab: {
-    position: "absolute",
-    right: 18,
-    bottom: 86,
-    backgroundColor: colors.primary,
-    borderColor: colors.primaryDark,
+  actionDisabled: {
+    backgroundColor: "#EEF3F8",
+    borderColor: colors.stroke,
     borderWidth: 1,
-    borderRadius: 16,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    shadowColor: "#0A1724",
-    shadowOpacity: 0.2,
-    shadowRadius: 14,
-    shadowOffset: { width: 0, height: 7 },
-    elevation: 6,
+    borderRadius: 10,
+    paddingVertical: 9,
+    paddingHorizontal: 14,
+    opacity: 0.9,
   },
-  fabText: {
-    color: colors.primaryText,
+  actionDisabledText: {
+    color: colors.textMuted,
     fontFamily: type.body,
-    fontSize: 14,
-    fontWeight: "800",
-    letterSpacing: 0.2,
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  footerLoader: {
+    paddingVertical: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+  },
+  footerLoaderText: {
+    color: colors.textMuted,
+    fontFamily: type.body,
+    fontSize: 12,
   },
   modalBackdrop: {
     flex: 1,
@@ -672,16 +925,23 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surface,
     borderTopLeftRadius: 22,
     borderTopRightRadius: 22,
+    maxHeight: "90%",
+  },
+  modalContent: {
     padding: 18,
     gap: 8,
-    maxHeight: "90%",
   },
   modalTitle: {
     color: colors.text,
     fontFamily: type.display,
     fontSize: 28,
     lineHeight: 34,
-    marginBottom: 4,
+  },
+  modalHint: {
+    color: colors.textMuted,
+    fontFamily: type.body,
+    fontSize: 13,
+    marginBottom: 6,
   },
   fieldLabel: {
     color: colors.textMuted,
@@ -699,72 +959,17 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 11,
     backgroundColor: colors.surfaceSoft,
-  },
-  inputText: {
     color: colors.text,
     fontFamily: type.body,
     fontSize: 14,
   },
-  segmentRow: {
-    flexDirection: "row",
-    gap: 8,
-  },
-  segment: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: colors.stroke,
-    borderRadius: 10,
-    paddingVertical: 10,
-    alignItems: "center",
-    backgroundColor: colors.surfaceSoft,
-  },
-  segmentActive: {
-    backgroundColor: colors.primary,
-    borderColor: colors.primaryDark,
-  },
-  segmentText: {
-    color: colors.textMuted,
-    fontFamily: type.body,
-    fontSize: 13,
-    fontWeight: "700",
-  },
-  segmentTextActive: {
-    color: colors.primaryText,
-  },
-  optionRow: {
-    flexDirection: "row",
-    gap: 8,
-  },
-  optionChip: {
-    minWidth: 54,
-    borderWidth: 1,
-    borderColor: colors.stroke,
-    borderRadius: 10,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    backgroundColor: colors.surfaceSoft,
-    alignItems: "center",
-  },
-  optionChipActive: {
-    backgroundColor: colors.primary,
-    borderColor: colors.primaryDark,
-  },
-  optionChipText: {
-    color: colors.textMuted,
-    fontFamily: type.body,
-    fontWeight: "700",
-  },
-  optionChipTextActive: {
-    color: colors.primaryText,
-  },
-  switchRow: {
+  toggleRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginTop: 4,
-    marginBottom: 4,
+    paddingVertical: 4,
   },
-  switchLabel: {
+  toggleLabel: {
     color: colors.text,
     fontFamily: type.body,
     fontSize: 14,
@@ -773,10 +978,10 @@ const styles = StyleSheet.create({
   modalActions: {
     flexDirection: "row",
     gap: 10,
-    marginTop: 6,
+    marginTop: 8,
     marginBottom: 6,
   },
-  cancelButton: {
+  modalCancelBtn: {
     flex: 1,
     backgroundColor: colors.surfaceSoft,
     borderColor: colors.stroke,
@@ -785,13 +990,13 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     alignItems: "center",
   },
-  cancelText: {
+  modalCancelText: {
     color: colors.text,
     fontFamily: type.body,
     fontSize: 14,
     fontWeight: "700",
   },
-  createButton: {
+  modalSaveBtn: {
     flex: 1,
     backgroundColor: colors.primary,
     borderColor: colors.primaryDark,
@@ -800,14 +1005,13 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     alignItems: "center",
   },
-  createButtonDisabled: {
-    opacity: 0.55,
+  modalSaveBtnDisabled: {
+    opacity: 0.6,
   },
-  createText: {
+  modalSaveText: {
     color: colors.primaryText,
     fontFamily: type.body,
     fontSize: 14,
     fontWeight: "700",
   },
 });
-

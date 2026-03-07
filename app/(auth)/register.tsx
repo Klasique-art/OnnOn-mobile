@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Href, Link, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
+import { AxiosError } from "axios";
 import {
   Keyboard,
   KeyboardAvoidingView,
@@ -16,6 +17,7 @@ import {
   AppErrorMessage,
   AppForm,
   AppFormField,
+  FormLoader,
   SubmitButton,
 } from "@/src/components/forms";
 import {
@@ -23,6 +25,31 @@ import {
   SignupValidationSchema,
 } from "@/src/validation/authSchemas";
 import { colors, type } from "@/src/theme/colors";
+import client from "@/lib/client";
+
+type RegisterResponse = {
+  success: boolean;
+  message: string;
+  token: string;
+  user: {
+    id: string;
+    email: string;
+    isVerified: boolean;
+  };
+};
+
+type RegisterErrorResponse = {
+  message?: string;
+};
+
+const logSignupError = (error: AxiosError<RegisterErrorResponse>) => {
+  console.warn("[Signup] Registration failed", {
+    message: error.message,
+    code: error.code,
+    status: error.response?.status,
+    responseData: error.response?.data,
+  });
+};
 
 export default function RegisterScreen() {
   const router = useRouter();
@@ -31,21 +58,39 @@ export default function RegisterScreen() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleSubmit = async (values: SignupFormValues, { resetForm }: any) => {
+  const handleSubmit = async (
+    values: SignupFormValues,
+    { resetForm }: { resetForm: () => void }
+  ) => {
     try {
       setIsLoading(true);
       setError(null);
 
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-
-      if (values.email.toLowerCase() === "taken@example.com") {
-        throw new Error("Email already exists");
-      }
+      const response = await client.post<RegisterResponse>("/users/register", {
+        email: values.email.trim(),
+        password: values.password,
+      });
 
       resetForm();
-      router.replace("/(auth)/verify-email" as Href);
-    } catch {
-      setError("Signup failed. Try another email or username.");
+      router.replace({
+        pathname: "/(auth)/verify-email" as Href,
+        params: {
+          email: values.email.trim(),
+          token: response.data.token,
+        },
+      });
+    } catch (err) {
+      const apiError = err as AxiosError<RegisterErrorResponse>;
+      const apiMessage = apiError.response?.data?.message;
+      logSignupError(apiError);
+
+      if (apiMessage) {
+        setError(apiMessage);
+      } else if (apiError.code === "ECONNABORTED") {
+        setError("Signup timed out. Please try again.");
+      } else {
+        setError("Signup failed. Please try again.");
+      }
     } finally {
       setIsLoading(false);
     }
@@ -82,9 +127,9 @@ export default function RegisterScreen() {
             </View>
 
             <View style={styles.formCard}>
+              <FormLoader visible={isLoading} label="Creating account..." />
               <AppForm<SignupFormValues>
                 initialValues={{
-                  username: "",
                   email: "",
                   password: "",
                   confirmPassword: "",
@@ -94,15 +139,6 @@ export default function RegisterScreen() {
               >
                 <>
                   <AppErrorMessage error={error || undefined} visible={!!error} />
-
-                  <AppFormField
-                    name="username"
-                    label="Username"
-                    placeholder="e.g. klassique"
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                    textContentType="username"
-                  />
 
                   <AppFormField
                     name="email"
@@ -115,19 +151,25 @@ export default function RegisterScreen() {
                   />
 
                   <AppFormField
+                    key={showPassword ? "password-visible" : "password-hidden"}
                     name="password"
                     label="Password"
                     placeholder="Create a password"
                     secureTextEntry={!showPassword}
                     autoCapitalize="none"
                     autoCorrect={false}
-                    textContentType="newPassword"
+                    textContentType="password"
                     icon={showPassword ? "eye-off-outline" : "eye-outline"}
                     iconPress={() => setShowPassword((prev) => !prev)}
                     iconAriaLabel={showPassword ? "Hide password" : "Show password"}
                   />
 
                   <AppFormField
+                    key={
+                      showConfirmPassword
+                        ? "confirm-password-visible"
+                        : "confirm-password-hidden"
+                    }
                     name="confirmPassword"
                     label="Confirm Password"
                     placeholder="Repeat your password"
@@ -144,7 +186,7 @@ export default function RegisterScreen() {
 
                   <View style={styles.securityHint}>
                     <Text style={styles.securityHintText}>
-                      Use at least 8 characters with uppercase, lowercase, and numbers.
+                      Use at least 8 characters with uppercase, lowercase, number, and symbol.
                     </Text>
                   </View>
 
@@ -241,6 +283,7 @@ const styles = StyleSheet.create({
     maxWidth: 300,
   },
   formCard: {
+    position: "relative",
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.stroke,
