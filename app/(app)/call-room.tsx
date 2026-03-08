@@ -4,9 +4,12 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import { AxiosError } from "axios";
 import Constants from "expo-constants";
 import * as ExpoLinking from "expo-linking";
-import * as Clipboard from "expo-clipboard";
+import { StatusBar } from "expo-status-bar";
+import { Image } from "expo-image";
 import {
+  AccessibilityInfo,
   Alert,
+  Animated,
   AppState,
   type AppStateStatus,
   FlatList,
@@ -24,9 +27,12 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { RTCView, type MediaStream } from "react-native-webrtc";
+import { useAuth } from "@/context/AuthContext";
 import ScreenNav from "@/src/components/ScreenNav";
 import AppPopup, { PopupAction, PopupTone } from "@/src/components/AppPopup";
+import { APP_LINK_BASE_URL } from "@/src/constants/links";
 import client from "@/lib/client";
+import { MeetingRealtimeController } from "@/src/realtime/meetingRealtime";
 import { colors, type } from "@/src/theme/colors";
 import {
   getLocalMediaStream,
@@ -66,9 +72,28 @@ import {
   formatMessageTime,
 } from "@/src/utils/callRoomUtils";
 
-const APP_LINK_BASE_URL = "https://onnon.app";
+const PLAN_DURATION_LIMITS_SECONDS: Record<string, number> = {
+  free: 40 * 60,
+  basic: 24 * 60 * 60,
+  pro: 24 * 60 * 60,
+};
+const MEETING_LIMIT_WARNING_SECONDS = 5 * 60;
+
+type RealtimeSessionState = {
+  wsUrl?: string;
+  roomId?: string;
+  participantId?: string;
+  sessionToken?: string;
+  routerRtpCapabilities?: Record<string, unknown>;
+  iceServers?: {
+    urls: string[];
+    username?: string;
+    credential?: string;
+  }[];
+};
 
 export default function CallRoomScreen() {
+  const { token } = useAuth();
   const { meetingId, title, invite, created } = useLocalSearchParams<{
     meetingId?: string | string[];
     title?: string | string[];
@@ -80,6 +105,7 @@ export default function CallRoomScreen() {
 
   const [callTitle, setCallTitle] = useState("Weekly Product Sync");
   const [displayName, setDisplayName] = useState("Participant");
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const [joinRoomId, setJoinRoomId] = useState("");
   const [joinPassword, setJoinPassword] = useState("");
   const [inviteRequiresPassword, setInviteRequiresPassword] = useState(false);
@@ -102,11 +128,19 @@ export default function CallRoomScreen() {
   const [isCamOn, setIsCamOn] = useState(true);
   const [isShareRequested, setIsShareRequested] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [meetingStartedAtMs, setMeetingStartedAtMs] = useState<number | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [screenShareStream, setScreenShareStream] = useState<MediaStream | null>(null);
   const [mediaInfo, setMediaInfo] = useState("Camera and mic not started yet.");
   const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false);
   const [canUseRecording, setCanUseRecording] = useState(false);
+  const [planId, setPlanId] = useState<"free" | "basic" | "pro" | null>(null);
+  const [meetingDurationLimitSeconds, setMeetingDurationLimitSeconds] = useState<number | null>(
+    null
+  );
+  const [realtimeSession, setRealtimeSession] = useState<RealtimeSessionState | null>(null);
+  const [remoteVideoStreams, setRemoteVideoStreams] = useState<Record<string, MediaStream>>({});
+  const [remoteScreenStreams, setRemoteScreenStreams] = useState<Record<string, MediaStream>>({});
   const [canUnmuteSelf, setCanUnmuteSelf] = useState(true);
   const [canStartVideo, setCanStartVideo] = useState(true);
   const [canScreenShare, setCanScreenShare] = useState(true);
@@ -116,6 +150,7 @@ export default function CallRoomScreen() {
   const [isUpdatingMeetingRecording, setIsUpdatingMeetingRecording] = useState(false);
   const [isRecordingArtifactsOpen, setIsRecordingArtifactsOpen] = useState(false);
   const roomIdRef = useRef("");
+  const realtimeControllerRef = useRef<MeetingRealtimeController | null>(null);
   const phaseRef = useRef<"lobby" | "inCall">("lobby");
   const isPollingStateRef = useRef(false);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -133,6 +168,20 @@ export default function CallRoomScreen() {
   const [popupActions, setPopupActions] = useState<PopupAction[]>([
     { label: "OK", variant: "primary" },
   ]);
+  const [meetingLimitToast, setMeetingLimitToast] = useState<{
+    visible: boolean;
+    title: string;
+    message: string;
+  }>({
+    visible: false,
+    title: "",
+    message: "",
+  });
+  const meetingLimitToastOpacity = useRef(new Animated.Value(0)).current;
+  const meetingLimitToastTranslateY = useRef(new Animated.Value(-14)).current;
+  const meetingLimitToastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasShownMeetingLimitWarningRef = useRef(false);
+  const hasProcessedMeetingLimitRef = useRef(false);
 
   const sharedMeetingId = useMemo(
     () => (Array.isArray(meetingId) ? meetingId[0] : meetingId),
@@ -189,6 +238,137 @@ export default function CallRoomScreen() {
     if (tileColumns === 3) return Math.max(132, Math.floor(tileWidth * 0.8));
     return Math.max(108, Math.floor(tileWidth * 0.76));
   }, [isSharingScreen, isSingleParticipantView, tileColumns, tileWidth]);
+  const formattedElapsed = useMemo(() => formatElapsed(elapsedSeconds), [elapsedSeconds]);
+  const remainingMeetingSeconds = useMemo(() => {
+    if (phase !== "inCall" || localRole !== "host" || !meetingDurationLimitSeconds) {
+      return null;
+    }
+    return Math.max(meetingDurationLimitSeconds - elapsedSeconds, 0);
+  }, [elapsedSeconds, localRole, meetingDurationLimitSeconds, phase]);
+  const formattedRemainingMeetingTime = useMemo(() => {
+    if (remainingMeetingSeconds === null) return null;
+    return formatElapsed(remainingMeetingSeconds);
+  }, [remainingMeetingSeconds]);
+  const resolvedPlanLabel = useMemo(() => {
+    if (planId === "basic") return "Basic";
+    if (planId === "pro") return "Pro";
+    if (planId === "free") return "Free";
+    return "current";
+  }, [planId]);
+
+  const hideMeetingLimitToast = useCallback(() => {
+    if (meetingLimitToastTimeoutRef.current) {
+      clearTimeout(meetingLimitToastTimeoutRef.current);
+      meetingLimitToastTimeoutRef.current = null;
+    }
+    Animated.parallel([
+      Animated.timing(meetingLimitToastOpacity, {
+        toValue: 0,
+        duration: 180,
+        useNativeDriver: true,
+      }),
+      Animated.timing(meetingLimitToastTranslateY, {
+        toValue: -14,
+        duration: 180,
+        useNativeDriver: true,
+      }),
+    ]).start(({ finished }) => {
+      if (finished) {
+        setMeetingLimitToast((prev) => ({ ...prev, visible: false }));
+      }
+    });
+  }, [meetingLimitToastOpacity, meetingLimitToastTranslateY]);
+
+  const showMeetingLimitToast = useCallback(
+    (title: string, message: string) => {
+      if (meetingLimitToastTimeoutRef.current) {
+        clearTimeout(meetingLimitToastTimeoutRef.current);
+      }
+      setMeetingLimitToast({
+        visible: true,
+        title,
+        message,
+      });
+      meetingLimitToastOpacity.setValue(0);
+      meetingLimitToastTranslateY.setValue(-14);
+      requestAnimationFrame(() => {
+        Animated.parallel([
+          Animated.timing(meetingLimitToastOpacity, {
+            toValue: 1,
+            duration: 220,
+            useNativeDriver: true,
+          }),
+          Animated.spring(meetingLimitToastTranslateY, {
+            toValue: 0,
+            damping: 18,
+            stiffness: 180,
+            mass: 0.9,
+            useNativeDriver: true,
+          }),
+        ]).start();
+      });
+      meetingLimitToastTimeoutRef.current = setTimeout(() => {
+        hideMeetingLimitToast();
+      }, 4500);
+      void AccessibilityInfo.announceForAccessibility(`${title}. ${message}`);
+    },
+    [hideMeetingLimitToast, meetingLimitToastOpacity, meetingLimitToastTranslateY]
+  );
+
+  const sortParticipants = useCallback((items: CallParticipant[]) => {
+    return [...items].sort((left, right) => {
+      if (left.isLocal && !right.isLocal) return -1;
+      if (!left.isLocal && right.isLocal) return 1;
+      if (left.isHost && !right.isHost) return -1;
+      if (!left.isHost && right.isHost) return 1;
+      return left.name.localeCompare(right.name);
+    });
+  }, []);
+
+  const toCallParticipant = useCallback(
+    (person: {
+      id: string;
+      displayName?: string;
+      avatar?: string | null;
+      isHost?: boolean;
+      isMicOn?: boolean;
+      isCameraOn?: boolean;
+      isScreenSharing?: boolean;
+      media?: {
+        micOn?: boolean;
+        cameraOn?: boolean;
+        screenSharing?: boolean;
+      };
+    }): CallParticipant => {
+      const fallbackName = (displayName.trim() || "You").toLowerCase();
+      const mediaMicOn =
+        typeof person.media?.micOn === "boolean" ? person.media.micOn : person.isMicOn;
+      const mediaCameraOn =
+        typeof person.media?.cameraOn === "boolean"
+          ? person.media.cameraOn
+          : person.isCameraOn;
+      const mediaScreenSharing =
+        typeof person.media?.screenSharing === "boolean"
+          ? person.media.screenSharing
+          : person.isScreenSharing;
+      const isLocal =
+        (localParticipantId && person.id === localParticipantId) ||
+        (realtimeSession?.participantId && person.id === realtimeSession.participantId) ||
+        person.displayName?.trim().toLowerCase() === fallbackName;
+
+      return {
+        id: person.id,
+        name: person.displayName || "Participant",
+        avatarUrl: isLocal ? avatarUrl : person.avatar || null,
+        isHost: Boolean(person.isHost),
+        isLocal: Boolean(isLocal),
+        isMicOn: Boolean(mediaMicOn),
+        isCameraOn: Boolean(mediaCameraOn),
+        isScreenSharing: Boolean(mediaScreenSharing),
+      };
+    },
+    [avatarUrl, displayName, localParticipantId, realtimeSession?.participantId]
+  );
 
   useEffect(() => {
     phaseRef.current = phase;
@@ -217,17 +397,16 @@ export default function CallRoomScreen() {
 
   useEffect(() => {
     return () => {
-      const activeRoomId = roomIdRef.current;
-      const activePhase = phaseRef.current;
-      if (activePhase === "inCall" && activeRoomId && !meetingEndedRef.current) {
-        void client
-          .post<LeaveMeetingResponse>(
-            `/meetings/${encodeURIComponent(activeRoomId)}/me/leave`
-          )
-          .catch(() => {
-            // Ignore teardown errors when screen unmounts.
-          });
+      if (meetingLimitToastTimeoutRef.current) {
+        clearTimeout(meetingLimitToastTimeoutRef.current);
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      // Do not auto-leave on screen unmount. Explicit leave/end actions handle
+      // server teardown; otherwise the meeting should remain resumable/live.
       stopStream(localStreamRef.current);
       stopStream(screenShareStreamRef.current);
     };
@@ -248,8 +427,12 @@ export default function CallRoomScreen() {
       try {
         const response = await client.get<ProfileResponse>("/profile/me");
         const resolvedName = response.data?.data?.displayName?.trim();
+        const resolvedAvatar = response.data?.data?.avatar?.trim() || null;
         if (!cancelled && resolvedName) {
           setDisplayName(resolvedName);
+        }
+        if (!cancelled) {
+          setAvatarUrl(resolvedAvatar);
         }
       } catch {
         // Keep default display name if profile cannot be loaded.
@@ -268,12 +451,24 @@ export default function CallRoomScreen() {
       try {
         const response = await client.get<SubscriptionResponse>("/payments/subscription");
         const canRecord = Boolean(response.data?.data?.entitlements?.recording);
+        const resolvedPlanId = response.data?.data?.planId || null;
+        const resolvedLimitSeconds =
+          typeof response.data?.data?.maxDurationMinutes === "number" &&
+          Number.isFinite(response.data.data.maxDurationMinutes)
+            ? response.data.data.maxDurationMinutes * 60
+            : resolvedPlanId
+              ? PLAN_DURATION_LIMITS_SECONDS[resolvedPlanId] ?? null
+              : null;
         if (!cancelled) {
           setCanUseRecording(canRecord);
+          setPlanId(resolvedPlanId);
+          setMeetingDurationLimitSeconds(resolvedLimitSeconds);
         }
       } catch {
         if (!cancelled) {
           setCanUseRecording(false);
+          setPlanId(null);
+          setMeetingDurationLimitSeconds(null);
         }
       }
     };
@@ -339,6 +534,14 @@ export default function CallRoomScreen() {
         setIsCamOn(Boolean(effectiveCam));
       }
       setRoomId(session.meetingId || fallbackRoomId);
+      setRealtimeSession({
+        wsUrl: session.realtime?.wsUrl,
+        roomId: session.realtime?.roomId || session.meetingId || fallbackRoomId,
+        participantId: session.realtime?.participantId || session.participantId,
+        sessionToken: session.session?.token,
+        routerRtpCapabilities: session.realtime?.sfu?.routerRtpCapabilities,
+        iceServers: session.realtime?.iceServers,
+      });
 
       const canUnmute = session.capabilities?.canUnmuteSelf;
       const canVideo = session.capabilities?.canStartVideo;
@@ -421,12 +624,14 @@ export default function CallRoomScreen() {
   ]);
 
   useEffect(() => {
-    if (phase !== "inCall") return;
-    const id = setInterval(() => {
-      setElapsedSeconds((prev) => prev + 1);
-    }, 1000);
+    if (phase !== "inCall" || !meetingStartedAtMs) return;
+    const syncElapsed = () => {
+      setElapsedSeconds(Math.max(0, Math.floor((Date.now() - meetingStartedAtMs) / 1000)));
+    };
+    syncElapsed();
+    const id = setInterval(syncElapsed, 1000);
     return () => clearInterval(id);
-  }, [phase]);
+  }, [meetingStartedAtMs, phase]);
 
   const fetchMeetingState = useCallback(async (activeRoomId: string) => {
     let response;
@@ -446,26 +651,13 @@ export default function CallRoomScreen() {
     const state = response.data?.data;
     if (!state) return;
 
-    const knownLocalId = localParticipantId;
-    const fallbackName = (displayName.trim() || "You").toLowerCase();
-    const rawParticipants: CallParticipant[] = state.participants.map((person) => {
-      const isLocal =
-        (knownLocalId && person.id === knownLocalId) ||
-        person.displayName?.trim().toLowerCase() === fallbackName;
-      return {
-        id: person.id,
-        name: person.displayName || "Participant",
-        isHost: Boolean(person.isHost),
-        isLocal: Boolean(isLocal),
-        isMicOn: Boolean(person.isMicOn),
-        isCameraOn: Boolean(person.isCameraOn),
-        isScreenSharing: Boolean(person.isScreenSharing),
-      };
-    });
+    const rawParticipants: CallParticipant[] = state.participants.map((person) =>
+      toCallParticipant(person)
+    );
     const dedupedById = Array.from(
       new Map(rawParticipants.map((person) => [person.id, person])).values()
     );
-    const localNameKey = fallbackName;
+    const localNameKey = (displayName.trim() || "You").toLowerCase();
     const localSelf = dedupedById.find((person) => person.isLocal);
     const nextParticipants =
       localSelf && localNameKey
@@ -484,7 +676,7 @@ export default function CallRoomScreen() {
     }
     setActiveScreenShareParticipantId(state.activeScreenShare?.participantId || null);
     if (nextParticipants.length > 0) {
-      setParticipants(nextParticipants);
+      setParticipants(sortParticipants(nextParticipants));
       const local = nextParticipants.find((person) => person.isLocal);
       if (local) {
         // Only sync mic/cam from polling when no PATCH update is currently in-flight.
@@ -501,7 +693,7 @@ export default function CallRoomScreen() {
         }
       }
     }
-  }, [displayName, localParticipantId]);
+  }, [displayName, localParticipantId, sortParticipants, toCallParticipant]);
 
   useEffect(() => {
     if (phase !== "inCall" || !roomId.trim()) return;
@@ -563,10 +755,6 @@ export default function CallRoomScreen() {
 
     return () => clearInterval(id);
   }, [participants, phase]);
-
-  const formattedElapsed = useMemo(() => formatElapsed(elapsedSeconds), [elapsedSeconds]);
-
-
 
   const setLocalParticipantState = (nextMicOn: boolean, nextCamOn: boolean) => {
     setParticipants((prev) =>
@@ -677,7 +865,7 @@ export default function CallRoomScreen() {
       const apiError = err as AxiosError<ApiErrorResponse>;
       setMediaInfo(
         apiError?.response?.data?.message ||
-          "Unable to start screen sharing on this device/build."
+        "Unable to start screen sharing on this device/build."
       );
     }
   };
@@ -735,9 +923,11 @@ export default function CallRoomScreen() {
     setJoinRoomId("");
     setJoinPassword("");
     setRoomId("");
+    setRealtimeSession(null);
     setLocalParticipantId(null);
     setLocalRole("host");
     setElapsedSeconds(0);
+    setMeetingStartedAtMs(null);
     setChatOpen(false);
     setParticipantsOpen(false);
     setIsMoreMenuOpen(false);
@@ -748,6 +938,11 @@ export default function CallRoomScreen() {
     setMeetingRecordingStatus("idle");
     setMeetingRecordingArtifacts([]);
     setIsUpdatingMeetingRecording(false);
+    setRemoteVideoStreams({});
+    setRemoteScreenStreams({});
+    hasShownMeetingLimitWarningRef.current = false;
+    hasProcessedMeetingLimitRef.current = false;
+    hideMeetingLimitToast();
     stopStream(localStreamRef.current);
     setLocalStream(null);
     stopStream(screenShareStreamRef.current);
@@ -757,7 +952,7 @@ export default function CallRoomScreen() {
     if (reason) {
       Alert.alert("Meeting Ended", reason);
     }
-  }, []);
+  }, [hideMeetingLimitToast]);
 
   // When any API call returns a 409 "Meeting has ended", exit the call and alert the user.
   useEffect(() => {
@@ -950,6 +1145,7 @@ export default function CallRoomScreen() {
     const local: CallParticipant = {
       id: localVisualId,
       name: displayName.trim() || "You",
+      avatarUrl,
       isLocal: true,
       isHost,
       isMicOn: micOn,
@@ -960,6 +1156,7 @@ export default function CallRoomScreen() {
     setSpeakerId(null);
     setChatMessages([]);
     setElapsedSeconds(0);
+    setMeetingStartedAtMs(Date.now());
     setPhase("inCall");
     await startOrRefreshLocalMedia({ audio: micOn, video: cameraOn });
     try {
@@ -1031,6 +1228,272 @@ export default function CallRoomScreen() {
   };
 
   const router = useRouter();
+
+  const handleMeetingDurationExpired = useCallback(async () => {
+    if (hasProcessedMeetingLimitRef.current) return;
+    hasProcessedMeetingLimitRef.current = true;
+    hideMeetingLimitToast();
+    const activeRoomId = roomId.trim();
+    if (activeRoomId) {
+      try {
+        await endMeetingOnServer(activeRoomId);
+      } catch {
+        // Continue local teardown even if server end fails.
+      }
+    }
+    clearMeetingLocally();
+    setPopupTitle("Meeting Ended");
+    setPopupMessage(
+      `Your ${resolvedPlanLabel} plan meeting time limit has been reached.`
+    );
+    setPopupTone("danger");
+    setPopupActions([
+      {
+        label: "Go Home",
+        variant: "primary",
+        onPress: () => router.replace("/(app)/(tabs)/home"),
+      },
+    ]);
+    setIsPopupVisible(true);
+    void AccessibilityInfo.announceForAccessibility(
+      `Meeting ended. Your ${resolvedPlanLabel} plan time limit has been reached.`
+    );
+  }, [clearMeetingLocally, hideMeetingLimitToast, resolvedPlanLabel, roomId, router]);
+
+  useEffect(() => {
+    if (
+      phase !== "inCall" ||
+      localRole !== "host" ||
+      remainingMeetingSeconds === null ||
+      !meetingDurationLimitSeconds
+    ) {
+      return;
+    }
+
+    if (
+      !hasShownMeetingLimitWarningRef.current &&
+      remainingMeetingSeconds > 0 &&
+      remainingMeetingSeconds <= MEETING_LIMIT_WARNING_SECONDS
+    ) {
+      hasShownMeetingLimitWarningRef.current = true;
+      showMeetingLimitToast(
+        `${formatElapsed(remainingMeetingSeconds)} remaining`,
+        `${resolvedPlanLabel} plan meetings end automatically when the timer reaches zero.`
+      );
+    }
+
+    if (remainingMeetingSeconds <= 0) {
+      void handleMeetingDurationExpired();
+    }
+  }, [
+    handleMeetingDurationExpired,
+    localRole,
+    meetingDurationLimitSeconds,
+    phase,
+    remainingMeetingSeconds,
+    resolvedPlanLabel,
+    showMeetingLimitToast,
+  ]);
+
+  const upsertParticipant = useCallback(
+    (participant: CallParticipant) => {
+      setParticipants((prev) => {
+        const next = prev.some((item) => item.id === participant.id)
+          ? prev.map((item) => (item.id === participant.id ? { ...item, ...participant } : item))
+          : [...prev, participant];
+        return sortParticipants(next);
+      });
+    },
+    [sortParticipants]
+  );
+
+  const removeParticipant = useCallback((participantId: string) => {
+    setParticipants((prev) => sortParticipants(prev.filter((item) => item.id !== participantId)));
+    setRemoteVideoStreams((prev) => {
+      const next = { ...prev };
+      delete next[participantId];
+      return next;
+    });
+    setRemoteScreenStreams((prev) => {
+      const next = { ...prev };
+      delete next[participantId];
+      return next;
+    });
+    setActiveScreenShareParticipantId((prev) =>
+      prev === participantId ? null : prev
+    );
+  }, [sortParticipants]);
+
+  useEffect(() => {
+    if (
+      phase !== "inCall" ||
+      !token ||
+      !roomId.trim() ||
+      !realtimeSession?.sessionToken ||
+      !realtimeSession.roomId
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new MeetingRealtimeController({
+      onRoomJoined: (payload) => {
+        if (cancelled) return;
+        setLocalParticipantId(payload.participantId);
+        setLocalRole(payload.role);
+        if (payload.participants.length > 0) {
+          const nextParticipants = sortParticipants(
+            payload.participants.map((participant) => toCallParticipant(participant))
+          );
+          setParticipants(nextParticipants);
+          const activeShare = nextParticipants.find((participant) => participant.isScreenSharing);
+          setActiveScreenShareParticipantId(activeShare?.id || null);
+        }
+      },
+      onParticipantJoined: (participant) => {
+        if (cancelled) return;
+        upsertParticipant(toCallParticipant(participant));
+      },
+      onParticipantLeft: (participantId) => {
+        if (cancelled) return;
+        removeParticipant(participantId);
+      },
+      onParticipantUpdated: (payload) => {
+        if (cancelled) return;
+        setParticipants((prev) =>
+          sortParticipants(
+            prev.map((participant) =>
+              participant.id === payload.participantId
+                ? {
+                    ...participant,
+                    isMicOn:
+                      typeof payload.isMicOn === "boolean"
+                        ? payload.isMicOn
+                        : participant.isMicOn,
+                    isCameraOn:
+                      typeof payload.isCameraOn === "boolean"
+                        ? payload.isCameraOn
+                        : participant.isCameraOn,
+                    isScreenSharing:
+                      typeof payload.isScreenSharing === "boolean"
+                        ? payload.isScreenSharing
+                        : participant.isScreenSharing,
+                  }
+                : participant
+            )
+          )
+        );
+        if (payload.isScreenSharing === true) {
+          setActiveScreenShareParticipantId(payload.participantId);
+        } else if (payload.isScreenSharing === false) {
+          setActiveScreenShareParticipantId((prev) =>
+            prev === payload.participantId ? null : prev
+          );
+        }
+      },
+      onMeetingEnded: (reason) => {
+        if (cancelled) return;
+        clearMeetingLocally(reason || "This meeting has ended.");
+      },
+      onRemoteStreamAdded: ({ participantId, source, stream }) => {
+        if (cancelled) return;
+        if (source === "screen") {
+          setRemoteScreenStreams((prev) => ({ ...prev, [participantId]: stream }));
+          setActiveScreenShareParticipantId(participantId);
+          return;
+        }
+        if (source === "camera") {
+          setRemoteVideoStreams((prev) => ({ ...prev, [participantId]: stream }));
+        }
+      },
+      onRemoteStreamRemoved: ({ participantId, source }) => {
+        if (cancelled || !participantId) return;
+        if (source === "screen") {
+          setRemoteScreenStreams((prev) => {
+            const next = { ...prev };
+            delete next[participantId];
+            return next;
+          });
+          setActiveScreenShareParticipantId((prev) =>
+            prev === participantId ? null : prev
+          );
+          return;
+        }
+        if (source === "camera") {
+          setRemoteVideoStreams((prev) => {
+            const next = { ...prev };
+            delete next[participantId];
+            return next;
+          });
+        }
+      },
+      onConnectionStateChange: (state) => {
+        if (cancelled) return;
+        if (state === "reconnecting") {
+          setMediaInfo("Realtime connection lost. Reconnecting...");
+        } else if (state === "connected") {
+          setMediaInfo((prev) =>
+            prev === "Realtime connection lost. Reconnecting..."
+              ? "Camera and mic connected."
+              : prev
+          );
+        }
+      },
+    });
+
+    realtimeControllerRef.current = controller;
+
+    void controller
+      .start({
+        authToken: token,
+        socketUrl: realtimeSession.wsUrl,
+        roomId: realtimeSession.roomId,
+        sessionToken: realtimeSession.sessionToken,
+        routerRtpCapabilities: realtimeSession.routerRtpCapabilities as
+          | Record<string, unknown>
+          | undefined,
+        iceServers: realtimeSession.iceServers,
+      })
+      .then(async () => {
+        if (cancelled) {
+          await controller.stop();
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setMediaInfo("Realtime connection unavailable. Falling back to state sync.");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      if (realtimeControllerRef.current === controller) {
+        realtimeControllerRef.current = null;
+      }
+      void controller.stop();
+    };
+  }, [
+    clearMeetingLocally,
+    phase,
+    realtimeSession,
+    removeParticipant,
+    roomId,
+    sortParticipants,
+    toCallParticipant,
+    token,
+    upsertParticipant,
+  ]);
+
+  useEffect(() => {
+    const controller = realtimeControllerRef.current;
+    if (!controller) return;
+    void controller.updateLocalMedia({
+      localStream,
+      screenShareStream,
+      micEnabled: isMicOn,
+      cameraEnabled: isCamOn,
+    });
+  }, [isCamOn, isMicOn, localStream, screenShareStream]);
 
   const leaveCall = async () => {
     const activeRoomId = roomId;
@@ -1240,7 +1703,13 @@ export default function CallRoomScreen() {
       return;
     }
     try {
-      await Clipboard.setStringAsync(url);
+      const clipboardModule = (await import("expo-clipboard")) as unknown as {
+        setStringAsync?: (value: string) => Promise<boolean>;
+      };
+      if (typeof clipboardModule?.setStringAsync !== "function") {
+        throw new Error("Clipboard module unavailable");
+      }
+      await clipboardModule.setStringAsync(url);
       setPopupTitle("Link Copied");
       setPopupMessage("Recording link copied to clipboard.");
       setPopupTone("success");
@@ -1248,7 +1717,7 @@ export default function CallRoomScreen() {
       setIsPopupVisible(true);
     } catch {
       setPopupTitle("Copy Failed");
-      setPopupMessage("Could not copy this recording link.");
+      setPopupMessage("Could not copy this recording link on this build.");
       setPopupTone("danger");
       setPopupActions([{ label: "OK", variant: "primary" }]);
       setIsPopupVisible(true);
@@ -1306,6 +1775,7 @@ export default function CallRoomScreen() {
   if (phase === "lobby") {
     return (
       <SafeAreaView style={styles.screen} edges={["top", "left", "right", "bottom"]}>
+        <StatusBar style="dark" />
         <ScrollView contentContainerStyle={styles.lobbyContent}>
           <View style={styles.bgOrbTop} />
           <View style={styles.bgOrbBottom} />
@@ -1499,6 +1969,7 @@ export default function CallRoomScreen() {
 
   return (
     <SafeAreaView style={styles.screen} edges={["top", "left", "right", "bottom"]}>
+      <StatusBar style="light" />
       <View style={styles.inCallHeader}>
         <View>
           <Text style={styles.roomTitle}>{callTitle}</Text>
@@ -1529,6 +2000,19 @@ export default function CallRoomScreen() {
               <Text style={styles.sharingBadgeText}>{activeScreenShareName} is sharing screen</Text>
             </View>
           ) : null}
+          {formattedRemainingMeetingTime ? (
+            <View
+              style={styles.meetingLimitBadge}
+              accessible
+              accessibilityRole="text"
+              accessibilityLabel={`Meeting time remaining ${formattedRemainingMeetingTime}`}
+            >
+              <Ionicons name="time-outline" size={12} color="#fff" />
+              <Text style={styles.meetingLimitBadgeText}>
+                Ends in {formattedRemainingMeetingTime}
+              </Text>
+            </View>
+          ) : null}
         </View>
         <View style={styles.headerActions}>
           <Pressable
@@ -1554,6 +2038,38 @@ export default function CallRoomScreen() {
         </View>
       </View>
 
+      {meetingLimitToast.visible ? (
+        <Animated.View
+          style={[
+            styles.meetingLimitToast,
+            {
+              opacity: meetingLimitToastOpacity,
+              transform: [{ translateY: meetingLimitToastTranslateY }],
+            },
+          ]}
+          accessible
+          accessibilityRole="alert"
+          accessibilityLiveRegion="assertive"
+        >
+          <View style={styles.meetingLimitToastIconWrap}>
+            <Ionicons name="alarm-outline" size={18} color="#7A4A00" />
+          </View>
+          <View style={styles.meetingLimitToastContent}>
+            <Text style={styles.meetingLimitToastTitle}>{meetingLimitToast.title}</Text>
+            <Text style={styles.meetingLimitToastText}>{meetingLimitToast.message}</Text>
+          </View>
+          <Pressable
+            onPress={hideMeetingLimitToast}
+            hitSlop={10}
+            style={styles.meetingLimitToastClose}
+            accessibilityRole="button"
+            accessibilityLabel="Dismiss meeting time warning"
+          >
+            <Ionicons name="close" size={16} color="#7A4A00" />
+          </Pressable>
+        </Animated.View>
+      ) : null}
+
       <FlatList
         data={participants}
         key={`${tileColumns}`}
@@ -1578,10 +2094,25 @@ export default function CallRoomScreen() {
                 />
               </View>
             </View>
+          ) : hasActiveScreenShare &&
+            activeScreenShareParticipantId &&
+            remoteScreenStreams[activeScreenShareParticipantId] ? (
+            <View style={styles.shareStageWrap}>
+              <Text style={styles.shareStageLabel}>Shared Screen</Text>
+              <View style={styles.shareStage}>
+                <RTCView
+                  streamURL={remoteScreenStreams[activeScreenShareParticipantId].toURL()}
+                  style={styles.shareStageVideo}
+                  objectFit="cover"
+                  zOrder={0}
+                />
+              </View>
+            </View>
           ) : null
         }
         renderItem={({ item }) => {
           const isSpeaking = speakerId === item.id;
+          const remoteVideoStream = !item.isLocal ? remoteVideoStreams[item.id] : null;
           return (
             <View
               style={[
@@ -1595,9 +2126,17 @@ export default function CallRoomScreen() {
             >
               {!item.isCameraOn ? (
                 <View style={styles.avatarFallback}>
-                  <Text style={styles.avatarFallbackText}>
-                    {item.name.slice(0, 2).toUpperCase()}
-                  </Text>
+                  {item.avatarUrl ? (
+                    <Image
+                      source={{ uri: item.avatarUrl }}
+                      style={styles.avatarFallbackImage}
+                      contentFit="cover"
+                    />
+                  ) : (
+                    <Text style={styles.avatarFallbackText}>
+                      {buildInitials(item.name)}
+                    </Text>
+                  )}
                 </View>
               ) : item.isLocal && isSharingScreen ? (
                 <View style={styles.shareSelfPlaceholder}>
@@ -1610,6 +2149,12 @@ export default function CallRoomScreen() {
                   style={styles.localVideo}
                   objectFit="cover"
                   mirror
+                />
+              ) : remoteVideoStream ? (
+                <RTCView
+                  streamURL={remoteVideoStream.toURL()}
+                  style={styles.localVideo}
+                  objectFit="cover"
                 />
               ) : (
                 <View style={styles.fakeVideoSurface}>
@@ -1748,7 +2293,7 @@ export default function CallRoomScreen() {
                 styles.moreMenuItem,
                 meetingRecordingStatus === "recording" && styles.moreMenuItemDanger,
                 (!canUseRecording || localRole !== "host" || isUpdatingMeetingRecording) &&
-                  styles.disabledBtn,
+                styles.disabledBtn,
               ]}
               onPress={() => void toggleMeetingRecording()}
               disabled={!canUseRecording || localRole !== "host" || isUpdatingMeetingRecording}
@@ -2272,6 +2817,78 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: "800",
   },
+  meetingLimitBadge: {
+    marginTop: 6,
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: "rgba(246, 164, 2, 0.22)",
+    borderWidth: 1,
+    borderColor: "rgba(246, 164, 2, 0.4)",
+  },
+  meetingLimitBadgeText: {
+    color: "#FFF6E8",
+    fontFamily: type.body,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  meetingLimitToast: {
+    position: "absolute",
+    top: 94,
+    left: 14,
+    right: 14,
+    zIndex: 30,
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#F6C063",
+    backgroundColor: "#FFF4DC",
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    shadowColor: "#000",
+    shadowOpacity: 0.14,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 5,
+  },
+  meetingLimitToastIconWrap: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#FFE0A8",
+    marginRight: 10,
+  },
+  meetingLimitToastContent: {
+    flex: 1,
+    gap: 2,
+  },
+  meetingLimitToastTitle: {
+    color: "#7A4A00",
+    fontFamily: type.body,
+    fontSize: 14,
+    fontWeight: "800",
+  },
+  meetingLimitToastText: {
+    color: "#7A4A00",
+    fontFamily: type.body,
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  meetingLimitToastClose: {
+    marginLeft: 8,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   headerActions: {
     flexDirection: "row",
     gap: 8,
@@ -2363,6 +2980,11 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
+    overflow: "hidden",
+  },
+  avatarFallbackImage: {
+    width: "100%",
+    height: "100%",
   },
   avatarFallbackText: {
     color: "#E6F0FF",

@@ -9,7 +9,7 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "lint": "expo lint",
-    "postinstall": "patch-package"
+    "postinstall": "node ./scripts/pin-webrtc-android-dependency.js"
   },
   "dependencies": {
     "@config-plugins/react-native-webrtc": "^13.0.0",
@@ -66,6 +66,15 @@
     "eslint": "^9.25.0",
     "eslint-config-expo": "~10.0.0",
     "typescript": "~5.9.2"
+  },
+  "expo": {
+    "doctor": {
+      "reactNativeDirectoryCheck": {
+        "exclude": [
+          "react-native-webrtc"
+        ]
+      }
+    }
   },
   "private": true
 }

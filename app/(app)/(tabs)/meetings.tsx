@@ -22,6 +22,7 @@ import CreateMeetingModal, {
 import EditMeetingModal, {
   type EditMeetingFormValues,
 } from "@/src/components/meetings/EditMeetingModal";
+import { APP_LINK_BASE_URL } from "@/src/constants/links";
 import { colors, type } from "@/src/theme/colors";
 
 type MeetingStatus = "live" | "scheduled" | "completed";
@@ -113,7 +114,6 @@ type SubscriptionResponse = {
 };
 
 const PAGE_LIMIT = 20;
-const APP_LINK_BASE_URL = "https://onnon.app";
 const DETECTED_TIMEZONE =
   Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
@@ -697,7 +697,7 @@ export default function MeetingsScreen() {
 
   return (
     <View style={styles.screen}>
-      <StatusBar style="light" />
+      <StatusBar style="dark" />
       <View style={styles.bgOrbTop} />
       <View style={styles.bgOrbBottom} />
 

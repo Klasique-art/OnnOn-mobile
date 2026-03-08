@@ -73,12 +73,12 @@ export default function RegisterScreen() {
 
       resetForm();
       router.replace({
-        pathname: "/(auth)/verify-email" as Href,
+        pathname: "/(auth)/verify-email",
         params: {
           email: values.email.trim(),
           token: response.data.token,
         },
-      });
+      } as Href);
     } catch (err) {
       const apiError = err as AxiosError<RegisterErrorResponse>;
       const apiMessage = apiError.response?.data?.message;

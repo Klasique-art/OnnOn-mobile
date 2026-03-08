@@ -3,11 +3,13 @@ export const ROOM_STATE_POLL_INTERVAL_MS = 10_000;
 export type ApiErrorResponse = {
     success?: boolean;
     message?: string;
+    code?: string;
 };
 
 export type CallParticipant = {
     id: string;
     name: string;
+    avatarUrl?: string | null;
     isHost: boolean;
     isLocal: boolean;
     isMicOn: boolean;
@@ -84,6 +86,11 @@ export type MyMeetingSession = {
         wsUrl?: string;
         roomId?: string;
         participantId?: string;
+        iceServers?: {
+            urls: string[];
+            username?: string;
+            credential?: string;
+        }[];
         sfu?: {
             routerRtpCapabilities?: Record<string, unknown>;
         };
@@ -104,15 +111,26 @@ export type MeetingStateResponse = {
         participants: {
             id: string;
             displayName: string;
+            avatar?: string | null;
             isHost: boolean;
             isMicOn: boolean;
             isCameraOn: boolean;
             isScreenSharing?: boolean;
+            joinedAt?: string;
+            lastSeenAt?: string;
+            media?: {
+                micOn?: boolean;
+                cameraOn?: boolean;
+                screenSharing?: boolean;
+            };
         }[];
         activeScreenShare?: {
             participantId?: string | null;
             startedAt?: string;
         } | null;
+        endedAt?: string | null;
+        lastActiveAt?: string;
+        resumeWindowSeconds?: number;
         settings?: {
             waitingRoom?: boolean;
             muteOnJoin?: boolean;
@@ -166,12 +184,15 @@ export type ProfileResponse = {
     success: boolean;
     data?: {
         displayName?: string;
+        avatar?: string | null;
     };
 };
 
 export type SubscriptionResponse = {
     success: boolean;
     data?: {
+        planId?: "free" | "basic" | "pro";
+        maxDurationMinutes?: number;
         entitlements?: {
             recording?: boolean;
         };

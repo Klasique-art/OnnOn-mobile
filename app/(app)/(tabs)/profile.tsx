@@ -22,6 +22,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useAuth } from "@/context/AuthContext";
 import client from "@/lib/client";
+import AppPopup, { PopupAction, PopupTone } from "@/src/components/AppPopup";
 import { FormLoader } from "@/src/components/forms";
 import { colors, type } from "@/src/theme/colors";
 
@@ -54,6 +55,11 @@ type ProfileResponse = {
 
 type ApiErrorResponse = {
   success?: boolean;
+  message?: string;
+};
+
+type LogoutResponse = {
+  success: boolean;
   message?: string;
 };
 
@@ -116,9 +122,35 @@ export default function ProfileScreen() {
   const [isSaving, setIsSaving] = useState(false);
   const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
   const [isRemovingAvatar, setIsRemovingAvatar] = useState(false);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [screenError, setScreenError] = useState<string | null>(null);
+  const [isPopupVisible, setIsPopupVisible] = useState(false);
+  const [popupTitle, setPopupTitle] = useState("");
+  const [popupMessage, setPopupMessage] = useState("");
+  const [popupTone, setPopupTone] = useState<PopupTone>("info");
+  const [popupActions, setPopupActions] = useState<PopupAction[]>([
+    { label: "OK", variant: "primary" },
+  ]);
 
-  const isBusy = isSaving || isUploadingAvatar || isRemovingAvatar;
+  const isBusy = isSaving || isUploadingAvatar || isRemovingAvatar || isLoggingOut;
+
+  const showPopup = ({
+    title,
+    message,
+    tone = "info",
+    actions = [{ label: "OK", variant: "primary" }],
+  }: {
+    title: string;
+    message?: string;
+    tone?: PopupTone;
+    actions?: PopupAction[];
+  }) => {
+    setPopupTitle(title);
+    setPopupMessage(message || "");
+    setPopupTone(tone);
+    setPopupActions(actions);
+    setIsPopupVisible(true);
+  };
 
   const loadProfile = async (showRefresh = false) => {
     if (showRefresh) setIsRefreshing(true);
@@ -274,8 +306,41 @@ export default function ProfileScreen() {
   };
 
   const onLogout = async () => {
-    await setToken(null);
-    router.replace("/(auth)/welcome");
+    try {
+      setIsLoggingOut(true);
+      await client.post<LogoutResponse>("/users/logout");
+      await setToken(null);
+      setIsPopupVisible(false);
+      router.replace("/(auth)/welcome");
+    } catch (err) {
+      const apiError = err as AxiosError<ApiErrorResponse>;
+      logProfileError("[Profile] Failed to logout", err);
+      showPopup({
+        title: "Logout Failed",
+        message: getErrorMessage(apiError, "Could not log out right now."),
+        tone: "danger",
+      });
+    } finally {
+      setIsLoggingOut(false);
+    }
+  };
+
+  const confirmLogout = () => {
+    showPopup({
+      title: "Log Out",
+      message: "Are you sure you want to log out of this account?",
+      tone: "danger",
+      actions: [
+        { label: "Cancel", variant: "secondary" },
+        {
+          label: isLoggingOut ? "Logging Out..." : "Log Out",
+          variant: "danger",
+          onPress: () => {
+            void onLogout();
+          },
+        },
+      ],
+    });
   };
 
   if (isLoadingProfile && !draft) {
@@ -428,6 +493,7 @@ export default function ProfileScreen() {
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Preferences</Text>
 
+            {/*
             <Text style={styles.fieldLabel}>Theme</Text>
             <View style={styles.segmentRow}>
               <ThemeButton
@@ -461,6 +527,7 @@ export default function ProfileScreen() {
                 }
               />
             </View>
+            */}
 
             <PreferenceRow
               label="Push Notifications"
@@ -548,9 +615,21 @@ export default function ProfileScreen() {
               </View>
             )}
 
-            <Pressable style={styles.logoutButton} onPress={onLogout}>
+            <Pressable
+              style={[styles.logoutButton, isBusy && styles.buttonDisabled]}
+              onPress={confirmLogout}
+              disabled={isBusy}
+            >
               <Text style={styles.logoutButtonText}>Log Out</Text>
             </Pressable>
+            <AppPopup
+              visible={isPopupVisible}
+              title={popupTitle}
+              message={popupMessage}
+              tone={popupTone}
+              actions={popupActions}
+              onClose={() => setIsPopupVisible(false)}
+            />
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -581,34 +660,6 @@ function PreferenceRow({
         thumbColor={value ? colors.primary : "#EEF3F8"}
       />
     </View>
-  );
-}
-
-function ThemeButton({
-  label,
-  selected,
-  disabled,
-  onPress,
-}: {
-  label: string;
-  selected: boolean;
-  disabled: boolean;
-  onPress: () => void;
-}) {
-  return (
-    <Pressable
-      style={[
-        styles.segment,
-        selected && styles.segmentActive,
-        disabled && styles.segmentDisabled,
-      ]}
-      onPress={onPress}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityState={{ selected, disabled }}
-    >
-      <Text style={[styles.segmentText, selected && styles.segmentTextActive]}>{label}</Text>
-    </Pressable>
   );
 }
 
@@ -844,37 +895,6 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     flex: 1,
     paddingRight: 8,
-  },
-  segmentRow: {
-    flexDirection: "row",
-    gap: 8,
-    marginBottom: 4,
-  },
-  segment: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: colors.stroke,
-    borderRadius: 12,
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 10,
-    backgroundColor: colors.surfaceSoft,
-  },
-  segmentActive: {
-    backgroundColor: colors.primary,
-    borderColor: colors.primaryDark,
-  },
-  segmentDisabled: {
-    opacity: 0.55,
-  },
-  segmentText: {
-    color: colors.textMuted,
-    fontFamily: type.body,
-    fontSize: 13,
-    fontWeight: "700",
-  },
-  segmentTextActive: {
-    color: colors.primaryText,
   },
   rowButtons: {
     flexDirection: "row",

@@ -3,11 +3,17 @@ import { runtimeConfig } from "@/src/config/runtime";
 
 class SocketManager {
   private socket: Socket | null = null;
+  private socketUrl: string | null = null;
 
-  connect(token: string) {
-    if (this.socket?.connected) return this.socket;
+  connect(token: string, socketUrl = runtimeConfig.socketUrl) {
+    if (this.socket?.connected && this.socketUrl === socketUrl) return this.socket;
 
-    this.socket = io(runtimeConfig.socketUrl, {
+    if (this.socket && this.socketUrl !== socketUrl) {
+      this.disconnect();
+    }
+
+    this.socketUrl = socketUrl;
+    this.socket = io(socketUrl, {
       transports: ["websocket"],
       auth: { token },
       autoConnect: true,
@@ -32,6 +38,7 @@ class SocketManager {
     this.socket.removeAllListeners();
     this.socket.disconnect();
     this.socket = null;
+    this.socketUrl = null;
   }
 }
 

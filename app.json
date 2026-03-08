@@ -12,7 +12,7 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.shopwit.OnnOn",
       "associatedDomains": [
-        "applinks:onnon.app"
+        "applinks:onnon.vercel.app"
       ],
       "infoPlist": {
         "NSCameraUsageDescription": "OnnOn needs camera access for video meetings.",
@@ -34,7 +34,7 @@
           "data": [
             {
               "scheme": "https",
-              "host": "onnon.app",
+              "host": "onnon.vercel.app",
               "pathPrefix": "/meeting"
             }
           ],
@@ -94,6 +94,7 @@
       ],
       "@react-native-community/datetimepicker",
       "@config-plugins/react-native-webrtc",
+      "./plugins/withPinnedWebRTCAndroidDependency",
       "./plugins/withWebRTCMediaProjection",
       [
         "react-native-nitro-screen-recorder",
